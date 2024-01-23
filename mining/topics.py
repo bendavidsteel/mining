@@ -132,7 +132,7 @@ class TopicModel:
                     json.dump([int(topic) for topic in topics], f)
 
                 np.save(os.path.join(self.run_dir_path, 'probs.npy'), probs)
-            self.write_topics_info(docs, topics, probs)
+            self.write_topics_info(docs=docs)
             
 
     def write_topics_info(self, docs=None, write_hierarchy=True):
