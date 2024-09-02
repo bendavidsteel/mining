@@ -1,12 +1,12 @@
 import numpy as np
 import torch
 
+import gpytorch
 import pyro
-import pyro.contrib.gp as gp
 import pyro.distributions as dist
 from pyro.infer import SVI, Trace_ELBO
-from pyro.optim import Adam
 from pyro import poutine
+import tqdm
 
 class StanceEstimation:
     def __init__(self, all_classifier_profiles):
@@ -414,38 +414,156 @@ def get_inferred_normal(dataset, opinion_sequences, all_classifier_indices):
 
     return user_stances, user_stance_vars
 
-def _get_process_prior(X, y):
-    kernel = gp.kernels.RBF(
-        input_dim=1, variance=torch.tensor(6.0), lengthscale=torch.tensor(0.05)
-    )
-    gpr = gp.models.GPRegression(X, y, kernel, noise=torch.tensor(0.2))
-    return kernel, gpr
+def truncate(times, sequences):
+    # hack to get nans
+    nan_idxs = torch.where(times != times)[0]
+    if len(nan_idxs) == 0:
+        return times, sequences
+    nan_idx = nan_idxs[0]
+    return times[:nan_idx], sequences[:nan_idx]
 
-def _train_gaussian_process(X, y):
-    kernel, gpr = _get_process_prior(X, y)    
+# We will use the simplest form of GP model, exact inference
+class ExactGPModel(gpytorch.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood):
+        super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
+        self.mean_module = gpytorch.means.ConstantMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
 
-    optimizer = torch.optim.Adam(gpr.parameters(), lr=0.005)
-    loss_fn = pyro.infer.Trace_ELBO().differentiable_loss
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+
+def train_gaussian_process(X_norm, y):
+    num_users = X_norm.shape[0]
+    num_opinions = y.shape[2]
+    models = []
+    likelihoods = []
+    # TODO consider difference likelihood functions
+    for i in tqdm.tqdm(range(num_users), "Fitting GPs to users"):
+        for j in range(num_opinions):
+            train_x, train_y = truncate(X_norm[i,:], y[i,:,j])
+            likelihood = gpytorch.likelihoods.GaussianLikelihood()
+            model = ExactGPModel(train_x, train_y, likelihood)
+            models.append(model)
+            likelihoods.append(likelihood)
+
+    model_list = gpytorch.models.IndependentModelList(*models)
+    likelihood_list = gpytorch.likelihoods.LikelihoodList(*likelihoods)
+
+    model_list.train()
+    likelihood_list.train()
+    optimizer = torch.optim.Adam(model_list.parameters(), lr=0.1)  # Includes GaussianLikelihood parameters
+    mll = gpytorch.mlls.SumMarginalLogLikelihood(likelihood_list, model_list)
+    
     losses = []
-    variances = []
-    lengthscales = []
-    noises = []
-    num_steps = 2000
-    for i in range(num_steps):
-        variances.append(gpr.kernel.variance.item())
-        noises.append(gpr.noise.item())
-        lengthscales.append(gpr.kernel.lengthscale.item())
+    training_iter = 50
+    for k in range(training_iter):
+        # Zero gradients from previous iteration
         optimizer.zero_grad()
-        loss = loss_fn(gpr.model, gpr.guide)
+        # Output from model
+        output = model_list(*model_list.train_inputs)
+        # Calc loss and backprop gradients
+        loss = -mll(output, model_list.train_targets)
         loss.backward()
+        print('Iter %d/%d - Loss: %.3f' % (i + 1, training_iter, loss.item()))
         optimizer.step()
         losses.append(loss.item())
 
-    return gpr, losses
+    return model_list, likelihood_list, losses
 
-def get_inferred_gaussian_process(dataset, opinion_sequences, all_classifier_indices):
-    X = dataset.get_timestamps()
-    y = opinion_sequences
+def prep_gp_data(dataset):
+    opinion_times, opinion_sequences, users, classifier_indices = dataset.get_data(start=0, end=dataset.max_time_step)
+    estimator = StanceEstimation(dataset.all_classifier_profiles)
+    estimator.set_stance(dataset.stance_columns[0])
+    X = torch.tensor(opinion_times).float()
+    max_x = torch.max(torch.nan_to_num(X, 0))
+    X_norm = X / max_x
+    y = torch.tensor(opinion_sequences).float()
 
-    gpr, _ = _train_gaussian_process(X, y)
-    return gpr
+def get_gp_means(dataset, model_list, likelihood_list, X_norm):
+    num_users = X_norm.shape[0]
+    num_opinions = len(dataset.stance_columns)
+    num_timesteps = 500
+    # TODO fix for actual timestamps
+    timestamps = np.linspace(0, dataset.max_time_step, num_timesteps)
+    means = np.full((num_users, num_timesteps, num_opinions), np.nan)
+    for i in range(num_users):
+        for j in range(num_opinions):
+            model = model_list.models[i*num_opinions+j]
+            likelihood = likelihood_list.likelihoods[i*num_opinions+j]
+
+            # Get into evaluation (predictive posterior) mode
+            model.eval()
+            likelihood.eval()
+
+            train_x, train_y = truncate(X_norm[i,:], y[i,:,j])
+            x_start = max(torch.min(train_x) - 0.1 * (torch.max(train_x) - torch.min(train_x)), 0.)
+            x_end = min(torch.max(train_x) + 0.1 * (torch.max(train_x) - torch.min(train_x)), 1.)
+            n_test = int((x_end - x_start) * num_timesteps)
+            test_x = torch.linspace(x_start, x_end, n_test)  # test inputs
+
+            # Test points are regularly spaced along [0,1]
+            # Make predictions by feeding model through likelihood
+            with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                observed_pred = likelihood(model(test_x))
+                mean = observed_pred.mean.numpy()
+
+            start_idx = int(x_start * num_timesteps)
+            means[i, start_idx:start_idx+mean.shape[0], j] = mean
+
+    return timestamps, means
+
+
+def get_inferred_gaussian_process(dataset):
+    X_norm, y = prep_gp_data(dataset)
+    model_list, likelihood_list, losses = train_gaussian_process(X_norm, y)
+    timestamps, means = get_gp_means(dataset, model_list, likelihood_list, X_norm)
+    
+    return timestamps, means
+
+def plot_gp_fit():
+    num_users = len(users)
+    num_opinions = len(dataset.stance_columns)
+    num_timesteps = 500
+    timestamps = np.linspace(0, dataset.max_time_step, num_timesteps)
+    means = np.full((num_users, num_timesteps, num_opinions), np.nan)
+    for i in range(num_users):
+        for j in range(num_opinions):
+            model = model_list.models[i*num_opinions+j]
+            likelihood = likelihood_list.likelihoods[i*num_opinions+j]
+
+            # Get into evaluation (predictive posterior) mode
+            model.eval()
+            likelihood.eval()
+
+            train_x, train_y = truncate(X_norm[i,:], y[i,:,j])
+            x_start = max(torch.min(train_x) - 0.1 * (torch.max(train_x) - torch.min(train_x)), 0.)
+            x_end = min(torch.max(train_x) + 0.1 * (torch.max(train_x) - torch.min(train_x)), 1.)
+            n_test = int((x_end - x_start) * num_timesteps)
+            test_x = torch.linspace(x_start, x_end, n_test)  # test inputs
+
+            # Test points are regularly spaced along [0,1]
+            # Make predictions by feeding model through likelihood
+            with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                observed_pred = likelihood(model(test_x))
+                mean = observed_pred.mean.numpy()
+
+            with torch.no_grad():
+                # Initialize plot
+                f, ax = plt.subplots(1, 1, figsize=(4, 3))
+
+                # Get upper and lower confidence bounds
+                lower, upper = observed_pred.confidence_region()
+                # Plot training data as black stars
+                ax.plot(train_x.numpy(), train_y.numpy(), 'k*')
+                # Plot predictive means as blue line
+                
+                ax.plot(test_x.numpy(), mean, 'b')
+                # Shade between the lower and upper confidence bounds
+                ax.fill_between(test_x.numpy(), lower.numpy(), upper.numpy(), alpha=0.5)
+                ax.set_ylim([-3, 3])
+                ax.legend(['Observed Data', 'Mean', 'Confidence'])
+                f.savefig(f'./figs/flows/user_{i}_op_{j}_pred.png')
+
