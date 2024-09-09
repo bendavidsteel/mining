@@ -441,7 +441,7 @@ def train_gaussian_process(X_norm, y):
     models = []
     likelihoods = []
     # TODO consider difference likelihood functions
-    for i in tqdm.tqdm(range(num_users), "Fitting GPs to users"):
+    for i in tqdm.tqdm(range(num_users), "Loading GPs"):
         for j in range(num_opinions):
             train_x, train_y = truncate(X_norm[i,:], y[i,:,j])
             likelihood = gpytorch.likelihoods.GaussianLikelihood()
@@ -467,7 +467,7 @@ def train_gaussian_process(X_norm, y):
         # Calc loss and backprop gradients
         loss = -mll(output, model_list.train_targets)
         loss.backward()
-        print('Iter %d/%d - Loss: %.3f' % (i + 1, training_iter, loss.item()))
+        print('Iter %d/%d - Loss: %.3f' % (k + 1, training_iter, loss.item()))
         optimizer.step()
         losses.append(loss.item())
 
@@ -481,8 +481,9 @@ def prep_gp_data(dataset):
     max_x = torch.max(torch.nan_to_num(X, 0))
     X_norm = X / max_x
     y = torch.tensor(opinion_sequences).float()
+    return X_norm, y
 
-def get_gp_means(dataset, model_list, likelihood_list, X_norm):
+def get_gp_means(dataset, model_list, likelihood_list, X_norm, y):
     num_users = X_norm.shape[0]
     num_opinions = len(dataset.stance_columns)
     num_timesteps = 500
