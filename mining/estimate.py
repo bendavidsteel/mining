@@ -1,11 +1,12 @@
-import numpy as np
-import torch
 
 import gpytorch
+import numpy as np
+import pandas as pd
 import pyro
 import pyro.distributions as dist
 from pyro.infer import SVI, Trace_ELBO
 from pyro import poutine
+import torch
 import tqdm
 
 class StanceEstimation:
@@ -422,6 +423,7 @@ def truncate(times, sequences):
     nan_idx = nan_idxs[0]
     return times[:nan_idx], sequences[:nan_idx]
 
+
 # We will use the simplest form of GP model, exact inference
 class ExactGPModel(gpytorch.models.ExactGP):
     def __init__(self, train_x, train_y, likelihood):
@@ -440,14 +442,21 @@ def train_gaussian_process(X_norm, y):
     num_opinions = y.shape[2]
     models = []
     likelihoods = []
+    model_map = []
     # TODO consider difference likelihood functions
-    for i in tqdm.tqdm(range(num_users), "Fitting GPs to users"):
+    for i in tqdm.tqdm(range(num_users), "Loading data to GPs"):
         for j in range(num_opinions):
-            train_x, train_y = truncate(X_norm[i,:], y[i,:,j])
+            if y[i,:,j].isnan().all():
+                continue
+            train_x = X_norm[i, ~torch.isnan(y[i,:,j])]
+            train_y = y[i, ~torch.isnan(y[i,:,j]), j]
+            
+            assert (~train_x.isnan().any()) and (~train_y.isnan().any())
             likelihood = gpytorch.likelihoods.GaussianLikelihood()
             model = ExactGPModel(train_x, train_y, likelihood)
             models.append(model)
             likelihoods.append(likelihood)
+            model_map.append((i, j))
 
     model_list = gpytorch.models.IndependentModelList(*models)
     likelihood_list = gpytorch.likelihoods.LikelihoodList(*likelihoods)
@@ -467,51 +476,54 @@ def train_gaussian_process(X_norm, y):
         # Calc loss and backprop gradients
         loss = -mll(output, model_list.train_targets)
         loss.backward()
-        print('Iter %d/%d - Loss: %.3f' % (i + 1, training_iter, loss.item()))
+        print('Iter %d/%d - Loss: %.3f' % (k + 1, training_iter, loss.item()))
         optimizer.step()
         losses.append(loss.item())
 
-    return model_list, likelihood_list, losses
+    return model_list, likelihood_list, model_map, losses
 
 def prep_gp_data(dataset):
-    opinion_times, opinion_sequences, users, classifier_indices = dataset.get_data(start=0, end=dataset.max_time_step)
+    opinion_times, opinion_sequences, users, classifier_indices = dataset.get_data()
     estimator = StanceEstimation(dataset.all_classifier_profiles)
     estimator.set_stance(dataset.stance_columns[0])
     X = torch.tensor(opinion_times).float()
     max_x = torch.max(torch.nan_to_num(X, 0))
     X_norm = X / max_x
     y = torch.tensor(opinion_sequences).float()
+    return X_norm, y
 
-def get_gp_means(dataset, model_list, likelihood_list, X_norm):
+def get_gp_means(dataset, model_list, likelihood_list, model_map, X_norm, y):
     num_users = X_norm.shape[0]
     num_opinions = len(dataset.stance_columns)
     num_timesteps = 500
     # TODO fix for actual timestamps
-    timestamps = np.linspace(0, dataset.max_time_step, num_timesteps)
+    if isinstance(dataset.min_timestamp, pd.Timestamp) and isinstance(dataset.max_timestamp, pd.Timestamp):
+        timestamps = np.linspace(dataset.min_timestamp.timestamp(), dataset.max_timestamp.timestamp(), num_timesteps)
+    else:
+        timestamps = np.linspace(dataset.min_timestamp, dataset.max_timestamp, num_timesteps)
     means = np.full((num_users, num_timesteps, num_opinions), np.nan)
-    for i in range(num_users):
-        for j in range(num_opinions):
-            model = model_list.models[i*num_opinions+j]
-            likelihood = likelihood_list.likelihoods[i*num_opinions+j]
+    for model_idx, (i, j) in enumerate(model_map):
+        model = model_list.models[model_idx]
+        likelihood = likelihood_list.likelihoods[model_idx]
 
-            # Get into evaluation (predictive posterior) mode
-            model.eval()
-            likelihood.eval()
+        # Get into evaluation (predictive posterior) mode
+        model.eval()
+        likelihood.eval()
 
-            train_x, train_y = truncate(X_norm[i,:], y[i,:,j])
-            x_start = max(torch.min(train_x) - 0.1 * (torch.max(train_x) - torch.min(train_x)), 0.)
-            x_end = min(torch.max(train_x) + 0.1 * (torch.max(train_x) - torch.min(train_x)), 1.)
-            n_test = int((x_end - x_start) * num_timesteps)
-            test_x = torch.linspace(x_start, x_end, n_test)  # test inputs
+        train_x, train_y = truncate(X_norm[i,:], y[i,:,j])
+        x_start = max(torch.min(train_x) - 0.1 * (torch.max(train_x) - torch.min(train_x)), 0.)
+        x_end = min(torch.max(train_x) + 0.1 * (torch.max(train_x) - torch.min(train_x)), 1.)
+        n_test = int((x_end - x_start) * num_timesteps)
+        test_x = torch.linspace(x_start, x_end, n_test)  # test inputs
 
-            # Test points are regularly spaced along [0,1]
-            # Make predictions by feeding model through likelihood
-            with torch.no_grad(), gpytorch.settings.fast_pred_var():
-                observed_pred = likelihood(model(test_x))
-                mean = observed_pred.mean.numpy()
+        # Test points are regularly spaced along [0,1]
+        # Make predictions by feeding model through likelihood
+        with torch.no_grad(), gpytorch.settings.fast_pred_var():
+            observed_pred = likelihood(model(test_x))
+            mean = observed_pred.mean.numpy()
 
-            start_idx = int(x_start * num_timesteps)
-            means[i, start_idx:start_idx+mean.shape[0], j] = mean
+        start_idx = int(x_start * num_timesteps)
+        means[i, start_idx:start_idx+mean.shape[0], j] = mean
 
     return timestamps, means
 

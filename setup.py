@@ -7,5 +7,5 @@ setup(name="mining",
       platforms=["any"],  # or more specific, e.g. "win32", "cygwin", "osx"
       license="MIT",
       url="http://github.com/bendavidsteel/mining",
-      packages=find_packages(),
+      install_requires=['pyro-ppl', 'gpytorch', 'bertopic', 'transformers', 'tqdm', 'torch', 'numpy', 'matplotlib'],
       )

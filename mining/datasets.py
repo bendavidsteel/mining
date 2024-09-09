@@ -104,13 +104,13 @@ class SocialInteractionDataset(torch.utils.data.Dataset):
 
 
 class GenerativeInteractionDataset(SocialInteractionDataset):
-    def __init__(self, model_creator, num_people=1000, max_time_step=1000):
+    def __init__(self, model_creator, num_people=1000, max_timestamp=1000):
         generative_model = model_creator(num_users=num_people)
 
         time_step = 0
         generative_model.reset()
 
-        for time_step in tqdm.tqdm(range(max_time_step)):
+        for time_step in tqdm.tqdm(range(max_timestamp)):
             generative_model.update(time_step)
 
         comments_df = generative_model.platform.comments
@@ -209,8 +209,8 @@ class OpinionTimelineDataset:
         self.all_classifier_profiles = all_classifier_profiles
         self.num_people = len(self.comment_df['user_id'].unique())
         self.aggregation = aggregation
-        self.min_time_step = self.comment_df['createtime'].min()
-        self.max_time_step = self.comment_df['createtime'].max()
+        self.min_timestamp = self.comment_df['createtime'].min()
+        self.max_timestamp = self.comment_df['createtime'].max()
         self.users = self.comment_df['user_id'].to_frame().drop_duplicates().reset_index(drop=True)
         self.subsample_users = subsample_users
         self.users = self.users.sample(n=self.subsample_users) if self.subsample_users is not None else self.users
@@ -220,7 +220,12 @@ class OpinionTimelineDataset:
         
         self.halflife = halflife
 
-    def get_data(self, start, end):
+    def get_data(self, start=None, end=None):
+        if not start:
+            start = self.min_timestamp
+        if not end:
+            end = self.max_timestamp
+
         if (isinstance(start, int) or isinstance(start, float) or isinstance(start, datetime.datetime)) and (isinstance(end, int) or isinstance(end, float), isinstance(end, datetime.datetime)):
             assert start != np.nan or end != np.nan, "start or end cannot be nan"
             comment_df = self.comment_df[(self.comment_df['createtime'] <= end) & (self.comment_df['createtime'] >= start)]
@@ -431,7 +436,7 @@ class OpinionTimelineDataset:
 
 
 class GenerativeOpinionTimelineDataset(OpinionTimelineDataset):
-    def __init__(self, num_people=None, max_time_step=None, num_opinions=None, generative_model=None, **kwargs):
+    def __init__(self, num_people=None, max_timestamp=None, num_opinions=None, generative_model=None, **kwargs):
         if generative_model is None:
             generative_model = generative.SocialGenerativeModel(
                 num_users=num_people,
@@ -441,7 +446,7 @@ class GenerativeOpinionTimelineDataset(OpinionTimelineDataset):
             time_step = 0
             generative_model.reset()
 
-            for time_step in tqdm.tqdm(range(max_time_step)):
+            for time_step in tqdm.tqdm(range(max_timestamp)):
                 generative_model.update(time_step)
 
         comments_df = generative_model.platform.comments

@@ -2,15 +2,25 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 
-def flow_pairplot(timestamps, means):
+def flow_pairplot(timestamps, means, separate=False):
     num_users, num_timesteps, num_opinions = means.shape
-    fig, axes = plt.subplots(nrows=num_opinions, ncols=num_opinions, figsize=(12, 12))
+    if separate:
+        figs, axes = np.zeros((num_opinions, num_opinions), dtype=object), np.zeros((num_opinions, num_opinions), dtype=object)
+        for i in range(num_opinions):
+            for j in range(num_opinions):
+                figs[i, j], axes[i, j] = plt.subplots(figsize=(6, 6))
+    else:
+        figs, axes = plt.subplots(nrows=num_opinions, ncols=num_opinions, figsize=(12, 12))
     for i in range(num_opinions):
         for j in range(num_opinions):
             ax = axes[i, j]
+            if separate:
+                fig = figs[i, j]
+            else:
+                fig = figs
             if i == j:
                 for k in range(num_users):
-                    ax.plot(timestamps, means[k,:,i])
+                    ax.plot(timestamps, means[k,:,i], alpha=0.2)
 
             if i < j:
                 for k in range(num_users):
@@ -61,10 +71,20 @@ def flow_pairplot(timestamps, means):
                 ax.set_xlim(-3, 3)
                 ax.set_ylim(-3, 3)
 
-            if j == 0:
-                ax.set_ylabel(f'Opinion {i+1}')
+            if separate:
+                if i == j:
+                    ax.set_ylabel('User')
+                    ax.set_xlabel('Time')
+                    ax.set_title(f'Opinion {i+1}')
 
-            if i == num_opinions - 1:
-                ax.set_xlabel(f'Opinion {i+1}')
+                else:
+                    ax.set_ylabel(f'Opinion {j+1}')
+                    ax.set_xlabel(f'Opinion {i+1}')
+            else:
+                if j == 0:
+                    ax.set_ylabel(f'Opinion {i+1}')
 
-    return fig, axes
+                if i == num_opinions - 1:
+                    ax.set_xlabel(f'Opinion {i+1}')
+
+    return figs, axes
