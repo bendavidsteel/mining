@@ -1,11 +1,12 @@
+import datetime
+
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 
 def flow_pairplot(timestamps, means, opinion_names, do_pairplot=True):
+
     num_users, num_timesteps, num_opinions = means.shape
-    min_timestamp = np.min(num_timesteps)
-    max_timestamp = np.max(num_timesteps)
     if do_pairplot:
         figs, axes = plt.subplots(nrows=num_opinions, ncols=num_opinions, figsize=(2.5 * num_opinions, 2.5 * num_opinions))
         figs.tight_layout()
@@ -25,21 +26,24 @@ def flow_pairplot(timestamps, means, opinion_names, do_pairplot=True):
                 fig = figs[i, j]
 
             ax = axes[i, j]
-            if do_pairplot:
-                fig = figs[i, j]
-            else:
-                fig = figs
+
             if i == j:
-                ax.set_xlim([min_timestamp, max_timestamp])
                 ax.set_ylim([-1, 1])
                 for k in range(num_users):
-                    ax.plot(timestamps, means[k,:,i], alpha=0.2)
+                    if np.isnan(means[k,:,i]).all():
+                        continue
+                    times = [datetime.datetime.fromtimestamp(t) for t in timestamps[k,:]]
+                    mean_diff = np.max(means[k,:,i]) - np.min(means[k,:,i])
+                    alpha = 0.1 + 0.6 * (mean_diff / 2)
+                    ax.plot(times, means[k,:,i], alpha=alpha)
 
             if i < j:
                 ax.set_xlim([-1, 1])
                 ax.set_ylim([-1, 1])
                 for k in range(num_users):
-                    ax.plot(means[k,:,i], means[k,:,j])
+                    if np.isnan(means[k,:,i]).all() or np.isnan(means[k,:,j]).all():
+                        continue
+                    ax.plot(means[k,:,i], means[k,:,j], alpha=0.2)
 
             if i > j:
                 # Implement vector field analysis
@@ -88,6 +92,12 @@ def flow_pairplot(timestamps, means, opinion_names, do_pairplot=True):
                 ax.set_ylim(-1, 1)
 
             if do_pairplot:
+                if j == 0:
+                    ax.set_ylabel(opinion_names[i])
+
+                if i == num_opinions - 1:
+                    ax.set_xlabel(opinion_names[j])
+            else:
                 if i == j:
                     ax.set_ylabel('User')
                     ax.set_xlabel('Time')
@@ -96,11 +106,6 @@ def flow_pairplot(timestamps, means, opinion_names, do_pairplot=True):
                 else:
                     ax.set_ylabel(opinion_names[j])
                     ax.set_xlabel(opinion_names[i])
-            else:
-                if j == 0:
-                    ax.set_ylabel(opinion_names[i])
-
-                if i == num_opinions - 1:
-                    ax.set_xlabel(opinion_names[j])
+                
 
     return figs, axes

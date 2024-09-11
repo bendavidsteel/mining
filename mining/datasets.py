@@ -247,7 +247,7 @@ class OpinionTimelineDataset:
                     continue
                 user_comments = user_comments.sort_values('createtime')
                 user_opinions = user_comments[self.stance_columns].values
-                user_times = user_comments['createtime'].values
+                user_times = user_comments['createtime'].map(lambda t: t.to_pydatetime().timestamp()).values
                 opinion_sequences[i, :len(user_opinions), :] = user_opinions
                 opinion_times[i, :len(user_opinions)] = user_times
                 classifier_indices[i, :len(user_opinions)] = user_comments['classifier_idx'].values

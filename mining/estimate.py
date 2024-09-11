@@ -415,20 +415,15 @@ def get_inferred_normal(dataset, opinion_sequences, all_classifier_indices):
 
     return user_stances, user_stance_vars
 
-def truncate(times, sequences):
-    # hack to get nans
-    nan_idxs = torch.where(times != times)[0]
-    if len(nan_idxs) == 0:
-        return times, sequences
-    nan_idx = nan_idxs[0]
-    return times[:nan_idx], sequences[:nan_idx]
-
 
 # We will use the simplest form of GP model, exact inference
 class ExactGPModel(gpytorch.models.ExactGP):
     def __init__(self, train_x, train_y, likelihood):
         super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
-        self.mean_module = gpytorch.means.ConstantMean()
+        self.mean_module = gpytorch.means.LinearMean()
+        # TODO set reasonable normal priors
+        lengthscale_prior = gpytorch.priors.NormalPrior(0, 1)
+        # TODO figure out which kernel to feed the prior to
         self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
 
     def forward(self, x):
@@ -452,6 +447,8 @@ def train_gaussian_process(X_norm, y):
             train_y = y[i, ~torch.isnan(y[i,:,j]), j]
             
             assert (~train_x.isnan().any()) and (~train_y.isnan().any())
+            # TODO use a new likelihood considering out y values are classifications
+            # https://docs.gpytorch.ai/en/stable/examples/01_Exact_GPs/GP_Regression_on_Classification_Labels.html
             likelihood = gpytorch.likelihoods.GaussianLikelihood()
             model = ExactGPModel(train_x, train_y, likelihood)
             models.append(model)
@@ -488,19 +485,17 @@ def prep_gp_data(dataset):
     estimator.set_stance(dataset.stance_columns[0])
     X = torch.tensor(opinion_times).float()
     max_x = torch.max(torch.nan_to_num(X, 0))
-    X_norm = X / max_x
+    min_x = torch.min(torch.nan_to_num(X, torch.inf))
+    X_norm = (X - min_x) / (max_x - min_x)
     y = torch.tensor(opinion_sequences).float()
-    return X_norm, y
+    return X_norm, X, y
 
-def get_gp_means(dataset, model_list, likelihood_list, model_map, X_norm, y):
+def get_gp_means(dataset, model_list, likelihood_list, model_map, X_norm, X, y):
     num_users = X_norm.shape[0]
     num_opinions = len(dataset.stance_columns)
     num_timesteps = 500
     # TODO fix for actual timestamps
-    if isinstance(dataset.min_timestamp, pd.Timestamp) and isinstance(dataset.max_timestamp, pd.Timestamp):
-        timestamps = np.linspace(dataset.min_timestamp.timestamp(), dataset.max_timestamp.timestamp(), num_timesteps)
-    else:
-        timestamps = np.linspace(dataset.min_timestamp, dataset.max_timestamp, num_timesteps)
+    timestamps = np.full((num_users, num_timesteps), np.nan)
     means = np.full((num_users, num_timesteps, num_opinions), np.nan)
     for model_idx, (i, j) in enumerate(model_map):
         model = model_list.models[model_idx]
@@ -510,11 +505,11 @@ def get_gp_means(dataset, model_list, likelihood_list, model_map, X_norm, y):
         model.eval()
         likelihood.eval()
 
-        train_x, train_y = truncate(X_norm[i,:], y[i,:,j])
-        x_start = max(torch.min(train_x) - 0.1 * (torch.max(train_x) - torch.min(train_x)), 0.)
-        x_end = min(torch.max(train_x) + 0.1 * (torch.max(train_x) - torch.min(train_x)), 1.)
-        n_test = int((x_end - x_start) * num_timesteps)
-        test_x = torch.linspace(x_start, x_end, n_test)  # test inputs
+        train_x_norm = X_norm[i, ~torch.isnan(y[i,:,j])]
+        x_norm_start = max(torch.min(train_x_norm) - 0.1 * (torch.max(train_x_norm) - torch.min(train_x_norm)), 0.)
+        x_norm_end = min(torch.max(train_x_norm) + 0.1 * (torch.max(train_x_norm) - torch.min(train_x_norm)), 1.)
+        # n_test = int((x_end - x_start) * num_timesteps)
+        test_x = torch.linspace(x_norm_start, x_norm_end, num_timesteps)  # test inputs
 
         # Test points are regularly spaced along [0,1]
         # Make predictions by feeding model through likelihood
@@ -522,8 +517,12 @@ def get_gp_means(dataset, model_list, likelihood_list, model_map, X_norm, y):
             observed_pred = likelihood(model(test_x))
             mean = observed_pred.mean.numpy()
 
-        start_idx = int(x_start * num_timesteps)
-        means[i, start_idx:start_idx+mean.shape[0], j] = mean
+        train_x = X[i, ~torch.isnan(y[i,:,j])]
+        x_start = torch.min(train_x) - 0.1 * (torch.max(train_x) - torch.min(train_x))
+        x_end = torch.max(train_x) + 0.1 * (torch.max(train_x) - torch.min(train_x))
+
+        timestamps[i, :] = np.linspace(x_start, x_end, num_timesteps)
+        means[i, :, j] = mean
 
     return timestamps, means
 
@@ -550,7 +549,8 @@ def plot_gp_fit():
             model.eval()
             likelihood.eval()
 
-            train_x, train_y = truncate(X_norm[i,:], y[i,:,j])
+            train_x = X_norm[i, ~torch.isnan(y[i,:,j])]
+            train_y = y[i, ~torch.isnan(y[i,:,j]), j]
             x_start = max(torch.min(train_x) - 0.1 * (torch.max(train_x) - torch.min(train_x)), 0.)
             x_end = min(torch.max(train_x) + 0.1 * (torch.max(train_x) - torch.min(train_x)), 1.)
             n_test = int((x_end - x_start) * num_timesteps)
