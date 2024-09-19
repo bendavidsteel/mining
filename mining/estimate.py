@@ -418,21 +418,28 @@ def get_inferred_normal(dataset, opinion_sequences, all_classifier_indices):
 
 # We will use the simplest form of GP model, exact inference
 class ExactGPModel(gpytorch.models.ExactGP):
-    def __init__(self, train_x, train_y, likelihood):
+    def __init__(self, train_x, train_y, likelihood, lengthscale_loc=1.0, lengthscale_scale=0.5):
         super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
-        self.mean_module = gpytorch.means.LinearMean()
+        # self.mean_module = gpytorch.means.LinearMean(input_size=1)
+        self.mean_module = gpytorch.means.ConstantMean()
         # TODO set reasonable normal priors
-        lengthscale_prior = gpytorch.priors.NormalPrior(0, 1)
+        lengthscale_prior = gpytorch.priors.NormalPrior(lengthscale_loc, lengthscale_scale)
         # TODO figure out which kernel to feed the prior to
-        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.RBFKernel(lengthscale_prior=lengthscale_prior)
+        )
 
     def forward(self, x):
         mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
+def get_gp_model(train_x, train_y, lengthscale_loc=1.0, lengthscale_scale=0.5):
+    likelihood = gpytorch.likelihoods.GaussianLikelihood()
+    model = ExactGPModel(train_x, train_y, likelihood, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale)
+    return model, likelihood
 
-def train_gaussian_process(X_norm, y):
+def get_gp_models(X_norm, y, lengthscale_loc=1.0, lengthscale_scale=0.5):
     num_users = X_norm.shape[0]
     num_opinions = y.shape[2]
     models = []
@@ -449,14 +456,17 @@ def train_gaussian_process(X_norm, y):
             assert (~train_x.isnan().any()) and (~train_y.isnan().any())
             # TODO use a new likelihood considering out y values are classifications
             # https://docs.gpytorch.ai/en/stable/examples/01_Exact_GPs/GP_Regression_on_Classification_Labels.html
-            likelihood = gpytorch.likelihoods.GaussianLikelihood()
-            model = ExactGPModel(train_x, train_y, likelihood)
+            model, likelihood = get_gp_model(train_x, train_y, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale)
             models.append(model)
             likelihoods.append(likelihood)
             model_map.append((i, j))
 
     model_list = gpytorch.models.IndependentModelList(*models)
     likelihood_list = gpytorch.likelihoods.LikelihoodList(*likelihoods)
+    return model_list, likelihood_list, model_map
+
+def train_gaussian_process(X_norm, y, lengthscale_loc=1.0, lengthscale_scale=0.5):
+    model_list, likelihood_list, model_map = get_gp_models(X_norm, y, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale)
 
     model_list.train()
     likelihood_list.train()

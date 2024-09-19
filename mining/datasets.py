@@ -209,8 +209,13 @@ class OpinionTimelineDataset:
         self.all_classifier_profiles = all_classifier_profiles
         self.num_people = len(self.comment_df['user_id'].unique())
         self.aggregation = aggregation
+
         self.min_timestamp = self.comment_df['createtime'].min()
         self.max_timestamp = self.comment_df['createtime'].max()
+        if isinstance(self.min_timestamp, np.int64):
+            self.min_timestamp = int(self.min_timestamp)
+            self.max_timestamp = int(self.max_timestamp)
+
         self.users = self.comment_df['user_id'].to_frame().drop_duplicates().reset_index(drop=True)
         self.subsample_users = subsample_users
         self.users = self.users.sample(n=self.subsample_users) if self.subsample_users is not None else self.users
@@ -226,7 +231,7 @@ class OpinionTimelineDataset:
         if not end:
             end = self.max_timestamp
 
-        if (isinstance(start, int) or isinstance(start, float) or isinstance(start, datetime.datetime)) and (isinstance(end, int) or isinstance(end, float), isinstance(end, datetime.datetime)):
+        if (isinstance(start, int) or isinstance(start, float) or isinstance(start, datetime.datetime)) and (isinstance(end, int) or isinstance(end, float) or isinstance(end, datetime.datetime)):
             assert start != np.nan or end != np.nan, "start or end cannot be nan"
             comment_df = self.comment_df[(self.comment_df['createtime'] <= end) & (self.comment_df['createtime'] >= start)]
 
@@ -247,7 +252,10 @@ class OpinionTimelineDataset:
                     continue
                 user_comments = user_comments.sort_values('createtime')
                 user_opinions = user_comments[self.stance_columns].values
-                user_times = user_comments['createtime'].map(lambda t: t.to_pydatetime().timestamp()).values
+                user_times_series = user_comments['createtime']
+                if user_times_series.dtype == np.dtype('datetime64[ns]'):
+                    user_times_series = user_times_series.map(lambda t: t.to_pydatetime().timestamp())
+                user_times = user_times_series.values
                 opinion_sequences[i, :len(user_opinions), :] = user_opinions
                 opinion_times[i, :len(user_opinions)] = user_times
                 classifier_indices[i, :len(user_opinions)] = user_comments['classifier_idx'].values
