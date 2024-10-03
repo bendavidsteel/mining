@@ -1,71 +1,77 @@
 
+from typing import Any, Dict
+
 import gpytorch
+import gpytorch.constraints
 import numpy as np
-import pandas as pd
 import pyro
 import pyro.distributions as dist
 from pyro.infer import SVI, Trace_ELBO
 from pyro import poutine
 import torch
+from torch import Tensor
 import tqdm
+
+def get_predict_probs(true_cat, confusion_profile):
+    predict_sum = sum(v for k, v in confusion_profile[true_cat].items())
+    predict_probs = torch.tensor([
+        confusion_profile[true_cat]["predicted_against"] / predict_sum,
+        confusion_profile[true_cat]["predicted_neutral"] / predict_sum,
+        confusion_profile[true_cat]["predicted_favor"] / predict_sum,
+    ])
+    return predict_probs
+
+def get_true_probs(predicted_cat, confusion_profile):
+    true_sum = sum(v[predicted_cat] for k, v in confusion_profile.items())
+    true_probs = torch.tensor([
+        confusion_profile["true_against"][predicted_cat] / true_sum,
+        confusion_profile["true_neutral"][predicted_cat] / true_sum,
+        confusion_profile["true_favor"][predicted_cat] / true_sum,
+    ])
+    return true_probs
+
+def get_predictor_confusion_probs(all_classifier_profiles):
+    predictor_confusion_probs = {}
+    for stance in all_classifier_profiles:
+        
+        predict_probs = torch.zeros(len(all_classifier_profiles[stance]), 3, 3)
+        true_probs = torch.zeros(len(all_classifier_profiles[stance]), 3, 3)
+
+        assert len(all_classifier_profiles[stance]) == max(all_classifier_profiles[stance].keys()) + 1
+        for predictor_id in all_classifier_profiles[stance]:
+            classifier_profile = all_classifier_profiles[stance][predictor_id]
+
+            try:
+                confusion_profile = {
+                    "true_favor": classifier_profile["true_favor"],
+                    "true_against": classifier_profile["true_against"],
+                    "true_neutral": classifier_profile["true_neutral"],
+                }
+            except KeyError:
+                continue
+
+            for true_idx, true_cat in enumerate(["true_against", "true_neutral", "true_favor"]):
+                try:
+                    predict_probs[predictor_id, true_idx, :] = get_predict_probs(true_cat, confusion_profile)
+                except ZeroDivisionError:
+                    predict_probs[predictor_id, true_idx, :] = torch.tensor([1/3, 1/3, 1/3])
+
+            for predicted_idx, predicted_cat in enumerate(["predicted_against", "predicted_neutral", "predicted_favor"]):
+                try:
+                    true_probs[predictor_id, predicted_idx, :] = get_true_probs(predicted_cat, confusion_profile)
+                except ZeroDivisionError:
+                    true_probs[predictor_id, predicted_idx, :] = torch.tensor([1/3, 1/3, 1/3])
+
+        predictor_confusion_probs[stance] = {
+            'predict_probs': predict_probs,
+            'true_probs': true_probs,
+        }
+    return predictor_confusion_probs
 
 class StanceEstimation:
     def __init__(self, all_classifier_profiles):
-
-        def get_predict_probs(true_cat, confusion_profile):
-            predict_sum = sum(v for k, v in confusion_profile[true_cat].items())
-            predict_probs = torch.tensor([
-                confusion_profile[true_cat]["predicted_against"] / predict_sum,
-                confusion_profile[true_cat]["predicted_neutral"] / predict_sum,
-                confusion_profile[true_cat]["predicted_favor"] / predict_sum,
-            ])
-            return predict_probs
+        self.predictor_confusion_probs = get_predictor_confusion_probs(all_classifier_profiles)
         
-        def get_true_probs(predicted_cat, confusion_profile):
-            true_sum = sum(v[predicted_cat] for k, v in confusion_profile.items())
-            true_probs = torch.tensor([
-                confusion_profile["true_against"][predicted_cat] / true_sum,
-                confusion_profile["true_neutral"][predicted_cat] / true_sum,
-                confusion_profile["true_favor"][predicted_cat] / true_sum,
-            ])
-            return true_probs
-
-        self.predictor_confusion_probs = {}
-        for stance in all_classifier_profiles:
-            
-            predict_probs = torch.zeros(len(all_classifier_profiles[stance]), 3, 3)
-            true_probs = torch.zeros(len(all_classifier_profiles[stance]), 3, 3)
-
-            assert len(all_classifier_profiles[stance]) == max(all_classifier_profiles[stance].keys()) + 1
-            for predictor_id in all_classifier_profiles[stance]:
-                classifier_profile = all_classifier_profiles[stance][predictor_id]
-
-                try:
-                    confusion_profile = {
-                        "true_favor": classifier_profile["true_favor"],
-                        "true_against": classifier_profile["true_against"],
-                        "true_neutral": classifier_profile["true_neutral"],
-                    }
-                except KeyError:
-                    continue
-
-                for true_idx, true_cat in enumerate(["true_against", "true_neutral", "true_favor"]):
-                    try:
-                        predict_probs[predictor_id, true_idx, :] = get_predict_probs(true_cat, confusion_profile)
-                    except ZeroDivisionError:
-                        predict_probs[predictor_id, true_idx, :] = torch.tensor([1/3, 1/3, 1/3])
-
-                for predicted_idx, predicted_cat in enumerate(["predicted_against", "predicted_neutral", "predicted_favor"]):
-                    try:
-                        true_probs[predictor_id, predicted_idx, :] = get_true_probs(predicted_cat, confusion_profile)
-                    except ZeroDivisionError:
-                        true_probs[predictor_id, predicted_idx, :] = torch.tensor([1/3, 1/3, 1/3])
-
-            self.predictor_confusion_probs[stance] = {
-                'predict_probs': predict_probs,
-                'true_probs': true_probs,
-            }
-
     def set_stance(self, stance):
         self.stance = stance
 
@@ -419,7 +425,7 @@ def get_inferred_normal(dataset, opinion_sequences, all_classifier_indices):
 # We will use the simplest form of GP model, exact inference
 class ExactGPModel(gpytorch.models.ExactGP):
     def __init__(self, train_x, train_y, likelihood, lengthscale_loc=1.0, lengthscale_scale=0.5):
-        super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
+        super().__init__(train_x, train_y, likelihood)
         # self.mean_module = gpytorch.means.LinearMean(input_size=1)
         self.mean_module = gpytorch.means.ConstantMean()
         # TODO set reasonable normal priors
@@ -433,18 +439,122 @@ class ExactGPModel(gpytorch.models.ExactGP):
         mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
-
+    
 def get_gp_model(train_x, train_y, lengthscale_loc=1.0, lengthscale_scale=0.5):
     likelihood = gpytorch.likelihoods.GaussianLikelihood()
     model = ExactGPModel(train_x, train_y, likelihood, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale)
     return model, likelihood
 
-def get_gp_models(X_norm, y, lengthscale_loc=1.0, lengthscale_scale=0.5):
+
+class DirichletGPModel(gpytorch.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood, num_classes, lengthscale_loc=1.0, lengthscale_scale=0.5):
+        super().__init__(train_x, train_y, likelihood)
+        # self.mean_module = gpytorch.means.LinearMean(input_size=1)
+        self.mean_module = gpytorch.means.ConstantMean(batch_shape=torch.Size((num_classes,)))
+        lengthscale_prior = gpytorch.priors.NormalPrior(lengthscale_loc, lengthscale_scale)
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.RBFKernel(lengthscale_prior=lengthscale_prior)
+        )
+
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+def get_dirichlet_gp_model(train_x, train_y, lengthscale_loc=1.0, lengthscale_scale=0.5):
+    if train_y.dtype == torch.float:
+        train_y = train_y.int() + 1
+    likelihood = gpytorch.likelihoods.DirichletClassificationLikelihood(train_y, learn_additional_noise=True)
+    model = DirichletGPModel(train_x, likelihood.transformed_targets, likelihood, likelihood.num_classes, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale)
+    return model, likelihood
+
+class GPClassificationModel(gpytorch.models.ApproximateGP):
+    def __init__(self, train_x, lengthscale_loc=1.0, lengthscale_scale=0.5):
+        variational_distribution = gpytorch.variational.CholeskyVariationalDistribution(train_x.size(0))
+        variational_strategy = gpytorch.variational.UnwhitenedVariationalStrategy(
+            self, train_x, variational_distribution, learn_inducing_locations=False
+        )
+        super(GPClassificationModel, self).__init__(variational_strategy)
+        self.mean_module = gpytorch.means.ConstantMean(constant_constraint=gpytorch.constraints.Interval(-1, 1))
+        lengthscale_prior = gpytorch.priors.NormalPrior(lengthscale_loc, lengthscale_scale)
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.RBFKernel(lengthscale_prior=lengthscale_prior)
+        )
+
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        latent_pred = gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+        return latent_pred
+    
+    def predict(self, x):
+        latent_pred = self(x)
+        # Apply tanh to constrain the mean
+        constrained_mean = torch.tanh(latent_pred.mean)
+        
+        # Adjust the covariance matrix using the derivative of tanh
+        derivative_tanh = 1 - constrained_mean**2
+        constrained_covar = derivative_tanh.unsqueeze(-1) * latent_pred.covariance_matrix * derivative_tanh.unsqueeze(-2)
+        
+        constrained_pred = gpytorch.distributions.MultivariateNormal(constrained_mean, constrained_covar)
+        
+        return constrained_pred
+
+class OrdinalLikelihood(gpytorch.likelihoods.Likelihood):
+    def __init__(self, num_classes, all_classifier_profiles):
+        super().__init__()
+        self.num_classes = num_classes
+        self.stance = 'stance_0'
+        self.predictor_confusion_probs = get_predictor_confusion_probs(all_classifier_profiles)
+        thres = 0.5
+        limit = 1
+        self.register_parameter('cutpoints', torch.nn.Parameter(torch.linspace(-thres, thres, self.num_classes-1)))
+        self.register_prior('cutpoints_prior', gpytorch.priors.NormalPrior(torch.linspace(-thres, thres, self.num_classes-1), 0.2), 'cutpoints')
+        self.register_constraint('cutpoints', gpytorch.constraints.Interval(
+            torch.linspace(-limit, limit, self.num_classes)[:-1], 
+            torch.linspace(-limit, limit, self.num_classes)[1:]
+        ))
+
+    def set_classifier_ids(self, classifier_ids):
+        self.classifier_ids = classifier_ids
+
+    def forward(self, function_samples: Tensor, *args: Any, data: Dict[str, Tensor] = {}, **kwargs: Any):
+        if isinstance(function_samples, gpytorch.distributions.MultivariateNormal):
+            function_samples = function_samples.sample()
+        
+        function_samples = torch.tanh(function_samples).unsqueeze(-1)
+        cutpoints = self.cutpoints.unsqueeze(0).unsqueeze(0)
+        
+        cumulative_probs = torch.sigmoid(cutpoints - function_samples)
+        probs = torch.cat([
+            cumulative_probs[..., :1],
+            cumulative_probs[..., 1:] - cumulative_probs[..., :-1],
+            1 - cumulative_probs[..., -1:],
+        ], dim=-1)
+        
+        # Apply confusion matrix
+        predict_probs = torch.einsum('sxc,xco->sxo', probs, self.predictor_confusion_probs[self.stance]['predict_probs'][self.classifier_ids])
+        
+        return torch.distributions.Categorical(probs=predict_probs)
+
+    def log_marginal(self, observations, function_dist, *args, **kwargs):
+        function_samples = function_dist.rsample()
+        return self.forward(function_samples).log_prob(observations).sum()
+
+
+def get_ordinal_gp_model(train_x, train_y, all_classifier_profiles, lengthscale_loc=1.0, lengthscale_scale=0.5):
+    likelihood = OrdinalLikelihood(3, all_classifier_profiles)
+    model = GPClassificationModel(train_x, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale)
+    return model, likelihood
+
+def get_gp_models(X_norm, y, classifier_ids, all_classifier_profiles, lengthscale_loc=1.0, lengthscale_scale=0.5, gp_type='dirichlet'):
     num_users = X_norm.shape[0]
     num_opinions = y.shape[2]
     models = []
     likelihoods = []
     model_map = []
+    train_xs = []
+    train_ys = []
     # TODO consider difference likelihood functions
     for i in tqdm.tqdm(range(num_users), "Loading data to GPs"):
         for j in range(num_opinions):
@@ -452,40 +562,89 @@ def get_gp_models(X_norm, y, lengthscale_loc=1.0, lengthscale_scale=0.5):
                 continue
             train_x = X_norm[i, ~torch.isnan(y[i,:,j])]
             train_y = y[i, ~torch.isnan(y[i,:,j]), j]
+            train_classifier_ids = classifier_ids[i, ~torch.isnan(y[i,:,j])]
+
+            if gp_type in ['dirichlet', 'ordinal']:
+                train_y += 1 # convert from -1, 0, 1 to 0, 1, 2
             
             assert (~train_x.isnan().any()) and (~train_y.isnan().any())
             # TODO use a new likelihood considering out y values are classifications
             # https://docs.gpytorch.ai/en/stable/examples/01_Exact_GPs/GP_Regression_on_Classification_Labels.html
-            model, likelihood = get_gp_model(train_x, train_y, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale)
+            if gp_type == 'dirichlet':
+                model, likelihood = get_dirichlet_gp_model(train_x, train_y, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale)
+            elif gp_type == 'normal':
+                model, likelihood = get_gp_model(train_x, train_y, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale)
+            elif gp_type == 'ordinal':
+                model, likelihood = get_ordinal_gp_model(train_x, train_y, all_classifier_profiles, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale)
             models.append(model)
             likelihoods.append(likelihood)
             model_map.append((i, j))
+            train_xs.append(train_x)
+            train_ys.append(train_y)
 
-    model_list = gpytorch.models.IndependentModelList(*models)
-    likelihood_list = gpytorch.likelihoods.LikelihoodList(*likelihoods)
-    return model_list, likelihood_list, model_map
+    if gp_type in ['normal', 'dirichlet']:
+        model_list = gpytorch.models.IndependentModelList(*models)
+        likelihood_list = gpytorch.likelihoods.LikelihoodList(*likelihoods)
+    elif gp_type == 'ordinal':
+        model_list = models
+        likelihood_list = likelihoods
+    return model_list, likelihood_list, model_map, train_xs, train_ys
 
-def train_gaussian_process(X_norm, y, lengthscale_loc=1.0, lengthscale_scale=0.5):
-    model_list, likelihood_list, model_map = get_gp_models(X_norm, y, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale)
+def train_gaussian_process(X_norm, y, classifier_ids, all_classifier_profiles, lengthscale_loc=1.0, lengthscale_scale=0.5, gp_type='dirichlet'):
+    model_list, likelihood_list, model_map, train_xs, train_ys = get_gp_models(X_norm, y, classifier_ids, all_classifier_profiles, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale, gp_type=gp_type)
 
-    model_list.train()
-    likelihood_list.train()
-    optimizer = torch.optim.Adam(model_list.parameters(), lr=0.1)  # Includes GaussianLikelihood parameters
-    mll = gpytorch.mlls.SumMarginalLogLikelihood(likelihood_list, model_list)
-    
-    losses = []
     training_iter = 50
-    for k in range(training_iter):
-        # Zero gradients from previous iteration
-        optimizer.zero_grad()
-        # Output from model
-        output = model_list(*model_list.train_inputs)
-        # Calc loss and backprop gradients
-        loss = -mll(output, model_list.train_targets)
-        loss.backward()
-        print('Iter %d/%d - Loss: %.3f' % (k + 1, training_iter, loss.item()))
-        optimizer.step()
-        losses.append(loss.item())
+    losses = []
+    if gp_type == 'normal':
+        model_list.train()
+        likelihood_list.train()
+        optimizer = torch.optim.Adam(model_list.parameters(), lr=0.1)  # Includes GaussianLikelihood parameters
+        mll = gpytorch.mlls.SumMarginalLogLikelihood(likelihood_list, model_list)
+        for k in range(training_iter):
+            # Zero gradients from previous iteration
+            optimizer.zero_grad()
+            # Output from model
+            output = model_list(*model_list.train_inputs)
+            # Calc loss and backprop gradients
+            loss = -mll(output, model_list.train_targets)
+            loss.backward()
+            print('Iter %d/%d - Loss: %.3f' % (k + 1, training_iter, loss.item()))
+            optimizer.step()
+            losses.append(loss.item())
+    elif gp_type == 'dirichlet':
+        for model, likelihood in zip(model_list.models, likelihood_list.likelihoods):
+            model.train()
+            likelihood.train()
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+            mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+
+            for k in range(training_iter):
+                optimizer.zero_grad()
+                output = model(model.train_inputs[0][:,0])
+                loss = -mll(output, likelihood.transformed_targets).sum()
+                loss.backward()
+                print('Iter %d/%d - Loss: %.3f' % (k + 1, training_iter, loss.item()))
+                optimizer.step()
+                losses.append(loss.item())
+    elif gp_type == 'ordinal':
+        for model, likelihood, train_X, train_y in zip(model_list, likelihood_list, train_xs, train_ys):
+            model.train()
+            likelihood.train()
+            optimizer = torch.optim.Adam([
+                {'params': model.parameters()},  # Includes GaussianLikelihood parameters
+                {'params': likelihood.parameters()},
+            ], lr=0.1)
+            mll = gpytorch.mlls.VariationalELBO(likelihood, model, train_y.numel())
+            training_iter = 500
+            for k in range(training_iter):
+                optimizer.zero_grad()
+                output = model(train_X)
+                likelihood.set_classifier_ids(classifier_ids[0])
+                loss = -mll(output, train_y)
+                loss.backward()
+                print('Iter %d/%d - Loss: %.3f' % (k + 1, training_iter, loss.item()))
+                optimizer.step()
+                losses.append(loss.item())
 
     return model_list, likelihood_list, model_map, losses
 
@@ -498,7 +657,7 @@ def prep_gp_data(dataset):
     min_x = torch.min(torch.nan_to_num(X, torch.inf))
     X_norm = (X - min_x) / (max_x - min_x)
     y = torch.tensor(opinion_sequences).float()
-    return X_norm, X, y
+    return X_norm, X, y, classifier_indices
 
 def get_gp_means(dataset, model_list, likelihood_list, model_map, X_norm, X, y):
     num_users = X_norm.shape[0]
