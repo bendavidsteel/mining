@@ -34,7 +34,7 @@ def flow_pairplot(timestamps, means, opinion_names, do_pairplot=True):
                         continue
                     times = [datetime.datetime.fromtimestamp(t) for t in timestamps[k,:]]
                     mean_diff = np.max(means[k,:,i]) - np.min(means[k,:,i])
-                    alpha = 0.1 + 0.6 * (mean_diff / 2)
+                    alpha = min(0.1 + 0.6 * (mean_diff / 2), 1.)
                     ax.plot(times, means[k,:,i], alpha=alpha)
 
             if i < j:

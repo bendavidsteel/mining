@@ -766,16 +766,12 @@ def get_gp_means(dataset, model_list, likelihood_list, model_map, X_norm, X, y):
 
     return timestamps, means, confidence_region
 
-def get_splines(X_norm, y):
+def get_splines(X_norm, y, alpha=1e-3, n_knots=4, degree=3):
     num_users = X_norm.shape[0]
     num_opinions = y.shape[2]
     models = []
-    likelihoods = []
     model_map = []
-    train_xs = []
-    train_ys = []
-    # TODO consider difference likelihood functions
-    for i in tqdm.tqdm(range(num_users), "Loading data to GPs"):
+    for i in tqdm.tqdm(range(num_users), "Fitting splines"):
         for j in range(num_opinions):
             if y[i,:,j].isnan().all():
                 continue
@@ -783,15 +779,42 @@ def get_splines(X_norm, y):
             train_y = y[i, ~torch.isnan(y[i,:,j]), j]
 
             assert (~train_x.isnan().any()) and (~train_y.isnan().any())
-            # TODO use a new likelihood considering out y values are classifications
-            # https://docs.gpytorch.ai/en/stable/examples/01_Exact_GPs/GP_Regression_on_Classification_Labels.html
             # B-spline with 4 + 3 - 1 = 6 basis functions
-            model = make_pipeline(SplineTransformer(n_knots=4, degree=3), Ridge(alpha=1e-3))
+            model = make_pipeline(SplineTransformer(n_knots=n_knots, degree=degree), Ridge(alpha=alpha))
             model.fit(train_x.reshape(-1, 1), train_y.reshape(-1, 1))
             models.append(model)
             model_map.append((i, j))
 
     return models, model_map
+
+def get_spline_means(dataset, model_list, model_map, X_norm, X, y):
+    num_users = X_norm.shape[0]
+    num_opinions = len(dataset.stance_columns)
+    num_timesteps = 100
+    # TODO fix for actual timestamps
+    timestamps = np.full((num_users, num_timesteps), np.nan)
+    means = np.full((num_users, num_timesteps, num_opinions), np.nan)
+    for model_idx, (i, j) in enumerate(model_map):
+        model = model_list[model_idx]
+
+        train_x_norm = X_norm[i, ~torch.isnan(y[i,:,j])]
+        x_norm_start = max(torch.min(train_x_norm), 0.)
+        x_norm_end = min(torch.max(train_x_norm), 1.)
+        # n_test = int((x_end - x_start) * num_timesteps)
+        test_x = torch.linspace(x_norm_start, x_norm_end, num_timesteps)  # test inputs
+
+        # Test points are regularly spaced along [0,1]
+        # Make predictions by feeding model through likelihood
+        mean = model.predict(test_x.reshape(-1, 1)).reshape(-1)
+
+        train_x = X[i, ~torch.isnan(y[i,:,j])]
+        x_start = torch.min(train_x)
+        x_end = torch.max(train_x)
+
+        timestamps[i, :] = np.linspace(x_start, x_end, num_timesteps)
+        means[i, :, j] = mean
+
+    return timestamps, means
 
 def get_inferred_gaussian_process(dataset):
     X_norm, y = prep_gp_data(dataset)
