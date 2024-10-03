@@ -766,7 +766,7 @@ def get_gp_means(dataset, model_list, likelihood_list, model_map, X_norm, X, y):
 
     return timestamps, means, confidence_region
 
-def fit_spline_with_ci(X, y, n_knots=4, degree=3, alpha=1e-3, n_bootstraps=1000, ci=95):
+def fit_spline_with_ci(X, y, n_knots=4, degree=3, alpha=1e-3, n_bootstraps=1000):
     X = X.reshape(-1, 1)
     y = y.reshape(-1, 1)
     n_samples = X.shape[0]
@@ -791,25 +791,17 @@ def fit_spline_with_ci(X, y, n_knots=4, degree=3, alpha=1e-3, n_bootstraps=1000,
         X_bootstrap_spline.transpose(0, 2, 1) @ y_bootstrap
     )
     
-    # Generate predictions
-    y_pred_bootstrap = X_spline @ coef_bootstrap.transpose(1, 0)
-    
-    # Calculate confidence intervals
-    lower_percentile = (100 - ci) / 2
-    upper_percentile = 100 - lower_percentile
-    y_pred_lower = np.percentile(y_pred_bootstrap, lower_percentile, axis=1)
-    y_pred_upper = np.percentile(y_pred_bootstrap, upper_percentile, axis=1)
-    
-    return model, y_pred_lower, y_pred_upper
+    return model, coef_bootstrap, spline_transformer
 
-def get_splines(X_norm, y, n_knots=4, degree=3, alpha=1e-3, n_bootstraps=1000, ci=95):
+def get_splines(X_norm, y, n_knots=4, degree=3, alpha=1e-3, n_bootstraps=1000):
     num_users = X_norm.shape[0]
     num_opinions = y.shape[2]
     models = []
-    confidence_intervals = []
+    coef_bootstraps = []
+    spline_transformers = []
     model_map = []
 
-    for i in tqdm.tqdm(range(num_users), "Fitting splines with confidence intervals"):
+    for i in tqdm.tqdm(range(num_users), "Fitting splines"):
         for j in range(num_opinions):
             if y[i,:,j].isnan().all():
                 continue
@@ -820,49 +812,63 @@ def get_splines(X_norm, y, n_knots=4, degree=3, alpha=1e-3, n_bootstraps=1000, c
             assert (~np.isnan(train_x).any()) and (~np.isnan(train_y).any())
             
             X_sorted = np.sort(train_x)
-            model, lower_ci, upper_ci = fit_spline_with_ci(
-                X_sorted, train_y, 
-                n_knots=n_knots, 
-                degree=degree, 
-                alpha=alpha, 
-                n_bootstraps=n_bootstraps, 
-                ci=ci
+            model, coef_bootstrap, spline_transformer = fit_spline_with_ci(
+                X_sorted, train_y,
+                n_knots=n_knots,
+                degree=degree,
+                alpha=alpha,
+                n_bootstraps=n_bootstraps
             )
             
             models.append(model)
-            confidence_intervals.append((lower_ci, upper_ci))
+            coef_bootstraps.append(coef_bootstrap)
+            spline_transformers.append(spline_transformer)
             model_map.append((i, j))
     
-    return models, confidence_intervals, model_map
+    return models, coef_bootstraps, spline_transformers, model_map
 
-def get_spline_means(dataset, model_list, model_map, X_norm, X, y):
+def get_spline_means(dataset, model_list, coef_bootstraps, spline_transformers, model_map, X_norm, X, y, ci=95):
     num_users = X_norm.shape[0]
     num_opinions = len(dataset.stance_columns)
     num_timesteps = 100
-    # TODO fix for actual timestamps
+    
     timestamps = np.full((num_users, num_timesteps), np.nan)
     means = np.full((num_users, num_timesteps, num_opinions), np.nan)
+    confidence_intervals = np.full((num_users, num_timesteps, num_opinions, 2), np.nan)  # New array for CIs
+
     for model_idx, (i, j) in enumerate(model_map):
         model = model_list[model_idx]
+        coef_bootstrap = coef_bootstraps[model_idx]
+        spline_transformer = spline_transformers[model_idx]
 
         train_x_norm = X_norm[i, ~torch.isnan(y[i,:,j])]
-        x_norm_start = max(torch.min(train_x_norm), 0.)
-        x_norm_end = min(torch.max(train_x_norm), 1.)
-        # n_test = int((x_end - x_start) * num_timesteps)
-        test_x = torch.linspace(x_norm_start, x_norm_end, num_timesteps)  # test inputs
-
-        # Test points are regularly spaced along [0,1]
-        # Make predictions by feeding model through likelihood
+        x_norm_start = torch.min(train_x_norm)
+        x_norm_end = torch.max(train_x_norm)
+        
+        test_x = torch.linspace(x_norm_start, x_norm_end, num_timesteps)
+        
+        # Make predictions
         mean = model.predict(test_x.reshape(-1, 1)).reshape(-1)
+        
+        # Calculate confidence intervals
+        X_spline = spline_transformer.transform(test_x.reshape(-1, 1))
+        y_pred_bootstrap = np.einsum('ij,nji->ni', X_spline, coef_bootstrap)
+        
+        lower_percentile = (100 - ci) / 2
+        upper_percentile = 100 - lower_percentile
+        y_pred_lower = np.percentile(y_pred_bootstrap, lower_percentile, axis=0)
+        y_pred_upper = np.percentile(y_pred_bootstrap, upper_percentile, axis=0)
 
         train_x = X[i, ~torch.isnan(y[i,:,j])]
         x_start = torch.min(train_x)
         x_end = torch.max(train_x)
-
+        
         timestamps[i, :] = np.linspace(x_start, x_end, num_timesteps)
         means[i, :, j] = mean
+        confidence_intervals[i, :, j, 0] = y_pred_lower
+        confidence_intervals[i, :, j, 1] = y_pred_upper
 
-    return timestamps, means
+    return timestamps, means, confidence_intervals
 
 def get_inferred_gaussian_process(dataset):
     X_norm, y = prep_gp_data(dataset)
