@@ -11,11 +11,10 @@ import numpy as np
 
 class TopicModel:
     def __init__(
-            self, 
-            model, 
-            model_name, 
-            num_docs,
-            data_dir_path,
+            self,
+            run_dir_path,
+            num_docs=None,
+            embedding_model=None,
             sample_frac=None,
             min_topic_frac=0.001,
             n_components=5,
@@ -25,24 +24,35 @@ class TopicModel:
         ):
         self.sample_frac = sample_frac
 
+        if sample_frac and not num_docs:
+            raise ValueError("num_docs must be provided if sample_frac is provided")
+        
+        if min_topic_frac and not num_docs:
+            raise ValueError("num_docs must be provided if min_topic_frac is provided")
+
         if sample_frac:
             min_topic_size = int(num_docs * sample_frac * min_topic_frac)
         else:
             min_topic_size = int(num_docs * min_topic_frac)
 
-        self.model = model
+        self.embedding_model = embedding_model
+        if not isinstance(embedding_model, str):
+            self.embedding_model_name = embedding_model.__class__.__name__
+        else:
+            self.embedding_model_name = embedding_model
 
         if not run_dir_name:
             sample_text = str(sample_frac).replace('.', '_') if sample_frac else "all"
-            run_dir_name = f'topics_{model_name}_{sample_text}'
+            run_dir_name = f'topics_{self.embedding_model_name}_{sample_text}'
 
-        this_embedding_name = f'embeddings_{model_name}.npy'
+        this_embedding_name = f'embeddings_{self.embedding_model_name}.npy'
 
-        run_dir_path = os.path.join(data_dir_path, run_dir_name)
+        run_dir_path = os.path.join(run_dir_path, run_dir_name)
         if not os.path.exists(run_dir_path):
             os.mkdir(run_dir_path)
 
-        self.embedding_path = os.path.join(data_dir_path, this_embedding_name)
+        self.embedding_path = os.path.join(run_dir_path, this_embedding_name)
+        self.save_embeddings = True
 
         self.run_dir_path = run_dir_path
 
@@ -81,7 +91,7 @@ class TopicModel:
         representation_model = KeyBERTInspired()
 
         self.topic_model = BERTopic(
-            embedding_model=model,
+            embedding_model=embedding_model,
             min_topic_size=min_topic_size,
             umap_model=umap_model,
             hdbscan_model=hdbscan_model,
@@ -95,19 +105,26 @@ class TopicModel:
         self.run_dir_path = new_dir_path
         self.embedding_path = os.path.join(new_dir_path, os.path.basename(self.embedding_path))
 
+    def _get_embeddings(self, docs):
+        self.topic_model.embedding_model = select_backend(self.embedding_model,
+                                                            language=self.topic_model.language)
+        embeddings = self.topic_model._extract_embeddings(docs,
+                                                method="document",
+                                                verbose=self.topic_model.verbose)
+        return embeddings
+
     def get_embeddings(self, docs):
-        if not os.path.exists(self.embedding_path):
-            self.topic_model.embedding_model = select_backend(self.model,
-                                                        language=self.topic_model.language)
-            embeddings = self.topic_model._extract_embeddings(docs,
-                                                    method="document",
-                                                    verbose=self.topic_model.verbose)
-            
-            with open(self.embedding_path, 'wb') as f:
-                np.save(f, embeddings)
+        if self.save_embeddings:
+            if not os.path.exists(self.embedding_path):
+                embeddings = self._get_embeddings(docs)
+                
+                with open(self.embedding_path, 'wb') as f:
+                    np.save(f, embeddings)
+            else:
+                with open(self.embedding_path, 'rb') as f:
+                    embeddings = np.load(f)
         else:
-            with open(self.embedding_path, 'rb') as f:
-                embeddings = np.load(f)
+            embeddings = self._get_embeddings(docs)
 
         return embeddings
     
@@ -148,16 +165,19 @@ class TopicModel:
             with open(os.path.join(self.run_dir_path, f'cluster_tree.txt'), 'w', encoding='utf-8') as f:
                 f.write(tree)
 
-    def transform(self, docs, embeddings=None):
+    def transform(self, docs, embeddings=None, write_to_file=False):
         if embeddings is None:
             embeddings = self.get_embeddings(docs)
 
         topics, probs = self.topic_model.transform(list(docs), embeddings=embeddings)
 
-        with open(os.path.join(self.run_dir_path, 'topics.json'), 'w') as f:
-            json.dump([int(topic) for topic in topics], f)
+        if write_to_file:
+            with open(os.path.join(self.run_dir_path, 'topics.json'), 'w') as f:
+                json.dump([int(topic) for topic in topics], f)
 
-        np.save(os.path.join(self.run_dir_path, 'probs.npy'), probs)
+            np.save(os.path.join(self.run_dir_path, 'probs.npy'), probs)
+
+        return topics, probs
 
 
     def visualize_topics(self, embeddings):
