@@ -8,6 +8,9 @@ import pyro
 import pyro.distributions as dist
 from pyro.infer import SVI, Trace_ELBO
 from pyro import poutine
+from sklearn.linear_model import Ridge
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import PolynomialFeatures, SplineTransformer
 import torch
 from torch import Tensor
 import tqdm
@@ -763,6 +766,32 @@ def get_gp_means(dataset, model_list, likelihood_list, model_map, X_norm, X, y):
 
     return timestamps, means, confidence_region
 
+def get_splines(X_norm, y):
+    num_users = X_norm.shape[0]
+    num_opinions = y.shape[2]
+    models = []
+    likelihoods = []
+    model_map = []
+    train_xs = []
+    train_ys = []
+    # TODO consider difference likelihood functions
+    for i in tqdm.tqdm(range(num_users), "Loading data to GPs"):
+        for j in range(num_opinions):
+            if y[i,:,j].isnan().all():
+                continue
+            train_x = X_norm[i, ~torch.isnan(y[i,:,j])]
+            train_y = y[i, ~torch.isnan(y[i,:,j]), j]
+
+            assert (~train_x.isnan().any()) and (~train_y.isnan().any())
+            # TODO use a new likelihood considering out y values are classifications
+            # https://docs.gpytorch.ai/en/stable/examples/01_Exact_GPs/GP_Regression_on_Classification_Labels.html
+            # B-spline with 4 + 3 - 1 = 6 basis functions
+            model = make_pipeline(SplineTransformer(n_knots=4, degree=3), Ridge(alpha=1e-3))
+            model.fit(train_x.reshape(-1, 1), train_y.reshape(-1, 1))
+            models.append(model)
+            model_map.append((i, j))
+
+    return models, model_map
 
 def get_inferred_gaussian_process(dataset):
     X_norm, y = prep_gp_data(dataset)
