@@ -766,26 +766,74 @@ def get_gp_means(dataset, model_list, likelihood_list, model_map, X_norm, X, y):
 
     return timestamps, means, confidence_region
 
-def get_splines(X_norm, y, alpha=1e-3, n_knots=4, degree=3):
+def fit_spline_with_ci(X, y, n_knots=4, degree=3, alpha=1e-3, n_bootstraps=1000, ci=95):
+    X = X.reshape(-1, 1)
+    y = y.reshape(-1, 1)
+    n_samples = X.shape[0]
+    
+    # Fit the original model
+    model = make_pipeline(SplineTransformer(n_knots=n_knots, degree=degree), Ridge(alpha=alpha))
+    model.fit(X, y)
+    
+    # Prepare bootstrap samples
+    bootstrap_indices = np.random.randint(0, n_samples, size=(n_bootstraps, n_samples))
+    X_bootstrap = X[bootstrap_indices]
+    y_bootstrap = y[bootstrap_indices]
+    
+    # Fit bootstrap models
+    spline_transformer = SplineTransformer(n_knots=n_knots, degree=degree)
+    X_spline = spline_transformer.fit_transform(X)
+    X_bootstrap_spline = spline_transformer.transform(X_bootstrap.reshape(-1, 1)).reshape(n_bootstraps, n_samples, -1)
+    
+    # Solve for coefficients
+    coef_bootstrap = np.linalg.solve(
+        X_bootstrap_spline.transpose(0, 2, 1) @ X_bootstrap_spline + alpha * np.eye(X_spline.shape[1]),
+        X_bootstrap_spline.transpose(0, 2, 1) @ y_bootstrap
+    )
+    
+    # Generate predictions
+    y_pred_bootstrap = X_spline @ coef_bootstrap.transpose(1, 0)
+    
+    # Calculate confidence intervals
+    lower_percentile = (100 - ci) / 2
+    upper_percentile = 100 - lower_percentile
+    y_pred_lower = np.percentile(y_pred_bootstrap, lower_percentile, axis=1)
+    y_pred_upper = np.percentile(y_pred_bootstrap, upper_percentile, axis=1)
+    
+    return model, y_pred_lower, y_pred_upper
+
+def get_splines(X_norm, y, n_knots=4, degree=3, alpha=1e-3, n_bootstraps=1000, ci=95):
     num_users = X_norm.shape[0]
     num_opinions = y.shape[2]
     models = []
+    confidence_intervals = []
     model_map = []
-    for i in tqdm.tqdm(range(num_users), "Fitting splines"):
+
+    for i in tqdm.tqdm(range(num_users), "Fitting splines with confidence intervals"):
         for j in range(num_opinions):
             if y[i,:,j].isnan().all():
                 continue
-            train_x = X_norm[i, ~torch.isnan(y[i,:,j])]
-            train_y = y[i, ~torch.isnan(y[i,:,j]), j]
-
-            assert (~train_x.isnan().any()) and (~train_y.isnan().any())
-            # B-spline with 4 + 3 - 1 = 6 basis functions
-            model = make_pipeline(SplineTransformer(n_knots=n_knots, degree=degree), Ridge(alpha=alpha))
-            model.fit(train_x.reshape(-1, 1), train_y.reshape(-1, 1))
+            
+            train_x = X_norm[i, ~torch.isnan(y[i,:,j])].numpy()
+            train_y = y[i, ~torch.isnan(y[i,:,j]), j].numpy()
+            
+            assert (~np.isnan(train_x).any()) and (~np.isnan(train_y).any())
+            
+            X_sorted = np.sort(train_x)
+            model, lower_ci, upper_ci = fit_spline_with_ci(
+                X_sorted, train_y, 
+                n_knots=n_knots, 
+                degree=degree, 
+                alpha=alpha, 
+                n_bootstraps=n_bootstraps, 
+                ci=ci
+            )
+            
             models.append(model)
+            confidence_intervals.append((lower_ci, upper_ci))
             model_map.append((i, j))
-
-    return models, model_map
+    
+    return models, confidence_intervals, model_map
 
 def get_spline_means(dataset, model_list, model_map, X_norm, X, y):
     num_users = X_norm.shape[0]
