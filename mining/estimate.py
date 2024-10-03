@@ -506,6 +506,9 @@ class OrdinalLikelihood(gpytorch.likelihoods.Likelihood):
         self.num_classes = num_classes
         self.stance = 'stance_0'
         self.predictor_confusion_probs = get_predictor_confusion_probs(all_classifier_profiles)
+        for stance in self.predictor_confusion_probs:
+            self.predictor_confusion_probs[stance]['predict_probs'] = self.predictor_confusion_probs[stance]['predict_probs'].to('cuda')
+            self.predictor_confusion_probs[stance]['true_probs'] = self.predictor_confusion_probs[stance]['true_probs'].to('cuda')
         thres = 0.5
         limit = 1
         self.register_parameter('cutpoints', torch.nn.Parameter(torch.linspace(-thres, thres, self.num_classes-1)))
@@ -628,6 +631,11 @@ def train_gaussian_process(X_norm, y, classifier_ids, all_classifier_profiles, l
                 losses.append(loss.item())
     elif gp_type == 'ordinal':
         for model, likelihood, train_X, train_y in zip(model_list, likelihood_list, train_xs, train_ys):
+            if torch.cuda.is_available():
+                model = model.cuda()
+                likelihood = likelihood.cuda()
+                train_X = train_X.cuda()
+                train_y = train_y.cuda()
             model.train()
             likelihood.train()
             optimizer = torch.optim.Adam([
