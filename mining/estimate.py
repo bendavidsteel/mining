@@ -476,7 +476,7 @@ class GPClassificationModel(gpytorch.models.ApproximateGP):
         )
         super(GPClassificationModel, self).__init__(variational_strategy)
         self.mean_module = gpytorch.means.ConstantMean(constant_constraint=gpytorch.constraints.Interval(-1, 1))
-        lengthscale_prior = gpytorch.priors.NormalPrior(lengthscale_loc, lengthscale_scale)
+        lengthscale_prior = gpytorch.priors.LogNormalPrior(loc=torch.log(torch.tensor(lengthscale_loc)), scale=lengthscale_scale)
         self.covar_module = gpytorch.kernels.ScaleKernel(
             gpytorch.kernels.RBFKernel(lengthscale_prior=lengthscale_prior)
         )
@@ -504,11 +504,11 @@ class OrdinalLikelihood(gpytorch.likelihoods.Likelihood):
     def __init__(self, num_classes, all_classifier_profiles):
         super().__init__()
         self.num_classes = num_classes
-        self.stance = 'stance_0'
         self.predictor_confusion_probs = get_predictor_confusion_probs(all_classifier_profiles)
-        for stance in self.predictor_confusion_probs:
-            self.predictor_confusion_probs[stance]['predict_probs'] = self.predictor_confusion_probs[stance]['predict_probs'].to('cuda')
-            self.predictor_confusion_probs[stance]['true_probs'] = self.predictor_confusion_probs[stance]['true_probs'].to('cuda')
+        if torch.cuda.is_available():
+            for stance in self.predictor_confusion_probs:
+                self.predictor_confusion_probs[stance]['predict_probs'] = self.predictor_confusion_probs[stance]['predict_probs'].to('cuda')
+                self.predictor_confusion_probs[stance]['true_probs'] = self.predictor_confusion_probs[stance]['true_probs'].to('cuda')
         thres = 0.5
         limit = 1
         self.register_parameter('cutpoints', torch.nn.Parameter(torch.linspace(-thres, thres, self.num_classes-1)))
@@ -518,10 +518,19 @@ class OrdinalLikelihood(gpytorch.likelihoods.Likelihood):
             torch.linspace(-limit, limit, self.num_classes)[1:]
         ))
 
+        self.classifier_ids = None
+        self.stance = None
+
     def set_classifier_ids(self, classifier_ids):
         self.classifier_ids = classifier_ids
 
+    def set_stance(self, stance):
+        self.stance = stance
+
     def forward(self, function_samples: Tensor, *args: Any, data: Dict[str, Tensor] = {}, **kwargs: Any):
+        assert self.classifier_ids is not None, "Classifier IDs not set"
+        assert self.stance is not None, "Stance not set"
+
         if isinstance(function_samples, gpytorch.distributions.MultivariateNormal):
             function_samples = function_samples.sample()
         
@@ -550,7 +559,7 @@ def get_ordinal_gp_model(train_x, train_y, all_classifier_profiles, lengthscale_
     model = GPClassificationModel(train_x, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale)
     return model, likelihood
 
-def get_gp_models(X_norm, y, classifier_ids, all_classifier_profiles, lengthscale_loc=1.0, lengthscale_scale=0.5, gp_type='dirichlet'):
+def get_gp_models(X_norm, y, classifier_ids, stance_targets, all_classifier_profiles, lengthscale_loc=1.0, lengthscale_scale=0.5, gp_type='dirichlet'):
     num_users = X_norm.shape[0]
     num_opinions = y.shape[2]
     models = []
@@ -579,6 +588,8 @@ def get_gp_models(X_norm, y, classifier_ids, all_classifier_profiles, lengthscal
                 model, likelihood = get_gp_model(train_x, train_y, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale)
             elif gp_type == 'ordinal':
                 model, likelihood = get_ordinal_gp_model(train_x, train_y, all_classifier_profiles, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale)
+                likelihood.set_classifier_ids(train_classifier_ids)
+                likelihood.set_stance(stance_targets[j])
             models.append(model)
             likelihoods.append(likelihood)
             model_map.append((i, j))
@@ -593,8 +604,8 @@ def get_gp_models(X_norm, y, classifier_ids, all_classifier_profiles, lengthscal
         likelihood_list = likelihoods
     return model_list, likelihood_list, model_map, train_xs, train_ys
 
-def train_gaussian_process(X_norm, y, classifier_ids, all_classifier_profiles, lengthscale_loc=1.0, lengthscale_scale=0.5, gp_type='dirichlet'):
-    model_list, likelihood_list, model_map, train_xs, train_ys = get_gp_models(X_norm, y, classifier_ids, all_classifier_profiles, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale, gp_type=gp_type)
+def train_gaussian_process(X_norm, y, classifier_ids, stance_targets, all_classifier_profiles, lengthscale_loc=1.0, lengthscale_scale=0.5, gp_type='dirichlet'):
+    model_list, likelihood_list, model_map, train_xs, train_ys = get_gp_models(X_norm, y, classifier_ids, stance_targets, all_classifier_profiles, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale, gp_type=gp_type)
 
     training_iter = 50
     losses = []
@@ -611,7 +622,8 @@ def train_gaussian_process(X_norm, y, classifier_ids, all_classifier_profiles, l
             # Calc loss and backprop gradients
             loss = -mll(output, model_list.train_targets)
             loss.backward()
-            print('Iter %d/%d - Loss: %.3f' % (k + 1, training_iter, loss.item()))
+            if k % 10 == 0:
+                print('Iter %d/%d - Loss: %.3f' % (k + 1, training_iter, loss.item()))
             optimizer.step()
             losses.append(loss.item())
     elif gp_type == 'dirichlet':
@@ -626,11 +638,12 @@ def train_gaussian_process(X_norm, y, classifier_ids, all_classifier_profiles, l
                 output = model(model.train_inputs[0][:,0])
                 loss = -mll(output, likelihood.transformed_targets).sum()
                 loss.backward()
-                print('Iter %d/%d - Loss: %.3f' % (k + 1, training_iter, loss.item()))
+                if k % 10 == 0:
+                    print('Iter %d/%d - Loss: %.3f' % (k + 1, training_iter, loss.item()))
                 optimizer.step()
                 losses.append(loss.item())
     elif gp_type == 'ordinal':
-        for model, likelihood, train_X, train_y in zip(model_list, likelihood_list, train_xs, train_ys):
+        for model, likelihood, model_idxs, train_X, train_y in zip(model_list, likelihood_list, model_map, train_xs, train_ys):
             if torch.cuda.is_available():
                 model = model.cuda()
                 likelihood = likelihood.cuda()
@@ -643,65 +656,112 @@ def train_gaussian_process(X_norm, y, classifier_ids, all_classifier_profiles, l
                 {'params': likelihood.parameters()},
             ], lr=0.1)
             mll = gpytorch.mlls.VariationalELBO(likelihood, model, train_y.numel())
-            training_iter = 500
-            for k in range(training_iter):
-                optimizer.zero_grad()
-                output = model(train_X)
-                likelihood.set_classifier_ids(classifier_ids[0])
-                loss = -mll(output, train_y)
-                loss.backward()
-                print('Iter %d/%d - Loss: %.3f' % (k + 1, training_iter, loss.item()))
-                optimizer.step()
-                losses.append(loss.item())
+            training_iter = 1000
+            with gpytorch.settings.cholesky_max_tries(5):
+                best_loss = torch.tensor(float('inf'))
+                num_since_best = 0
+                num_iters_before_stopping = training_iter // 10
+                for k in range(training_iter):
+                    optimizer.zero_grad()
+                    output = model(train_X)
+                    loss = -mll(output, train_y)
+                    loss.backward()
+                    if k % 50 == 0:
+                        print('Iter %d/%d - Loss: %.3f' % (k + 1, training_iter, loss.item()))
+                    optimizer.step()
+                    losses.append(loss.item())
+                    if loss.item() < best_loss:
+                        best_loss = loss.item()
+                        num_since_best = 0
+                    else:
+                        num_since_best += 1
+                    if num_since_best > num_iters_before_stopping:
+                        break
 
     return model_list, likelihood_list, model_map, losses
+
+def nanstd(o,dim):
+    return torch.sqrt(
+                torch.nanmean(
+                    torch.pow( torch.abs(o-torch.nanmean(o,dim=dim).unsqueeze(dim)),2),
+                    dim=dim)
+                )
 
 def prep_gp_data(dataset):
     opinion_times, opinion_sequences, users, classifier_indices = dataset.get_data()
     estimator = StanceEstimation(dataset.all_classifier_profiles)
     estimator.set_stance(dataset.stance_columns[0])
     X = torch.tensor(opinion_times).float()
-    max_x = torch.max(torch.nan_to_num(X, 0))
-    min_x = torch.min(torch.nan_to_num(X, torch.inf))
-    X_norm = (X - min_x) / (max_x - min_x)
+    # max_x = torch.max(torch.nan_to_num(X, 0))
+    # min_x = torch.min(torch.nan_to_num(X, torch.inf))
+    # X_norm = (X - min_x) / (max_x - min_x)
+    x_mean = torch.nanmean(X, dim=1)
+    x_std = nanstd(X, dim=1)
+    X_norm = (X - x_mean.unsqueeze(-1)) / x_std.unsqueeze(-1)
     y = torch.tensor(opinion_sequences).float()
     return X_norm, X, y, classifier_indices
+
+def get_mean_and_confidence_region(model, test_x):
+    with gpytorch.settings.cholesky_max_tries(5):
+        model_pred = model(test_x)
+    if model_pred.loc.is_cuda:
+        mean = model_pred.loc.cpu().numpy()
+        lower = model_pred.confidence_region()[0].cpu().numpy()
+        upper = model_pred.confidence_region()[1].cpu().numpy()
+    else:
+        mean = model_pred.loc.numpy()
+        lower = model_pred.confidence_region()[0].numpy()
+        upper = model_pred.confidence_region()[1].numpy()
+    return mean, lower, upper
 
 def get_gp_means(dataset, model_list, likelihood_list, model_map, X_norm, X, y):
     num_users = X_norm.shape[0]
     num_opinions = len(dataset.stance_columns)
-    num_timesteps = 500
+    num_timesteps = 100
     # TODO fix for actual timestamps
     timestamps = np.full((num_users, num_timesteps), np.nan)
     means = np.full((num_users, num_timesteps, num_opinions), np.nan)
+    confidence_region = np.full((num_users, num_timesteps, num_opinions, 2), np.nan)
     for model_idx, (i, j) in enumerate(model_map):
-        model = model_list.models[model_idx]
-        likelihood = likelihood_list.likelihoods[model_idx]
+        if hasattr(model_list, 'models'):
+            model = model_list.models[model_idx]
+            likelihood = likelihood_list.likelihoods[model_idx]
+        else:
+            model = model_list[model_idx]
+            likelihood = likelihood_list[model_idx]
 
         # Get into evaluation (predictive posterior) mode
         model.eval()
         likelihood.eval()
 
         train_x_norm = X_norm[i, ~torch.isnan(y[i,:,j])]
-        x_norm_start = max(torch.min(train_x_norm) - 0.1 * (torch.max(train_x_norm) - torch.min(train_x_norm)), 0.)
-        x_norm_end = min(torch.max(train_x_norm) + 0.1 * (torch.max(train_x_norm) - torch.min(train_x_norm)), 1.)
+        x_norm_start = max(torch.min(train_x_norm), 0.)
+        x_norm_end = min(torch.max(train_x_norm), 1.)
         # n_test = int((x_end - x_start) * num_timesteps)
         test_x = torch.linspace(x_norm_start, x_norm_end, num_timesteps)  # test inputs
 
         # Test points are regularly spaced along [0,1]
         # Make predictions by feeding model through likelihood
         with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            observed_pred = likelihood(model(test_x))
-            mean = observed_pred.mean.numpy()
+            batch_size = 10
+            batches = [test_x[i:i+batch_size] for i in range(0, len(test_x), batch_size)]
+            mean, lower, upper = get_mean_and_confidence_region(model, batches[0])
+            for batch in batches[1:]:
+                batch_mean, batch_lower, batch_upper = get_mean_and_confidence_region(model, batch)
+                mean = np.concatenate((mean, batch_mean), axis=0)
+                lower = np.concatenate((lower, batch_lower), axis=0)
+                upper = np.concatenate((upper, batch_upper), axis=0)
 
         train_x = X[i, ~torch.isnan(y[i,:,j])]
-        x_start = torch.min(train_x) - 0.1 * (torch.max(train_x) - torch.min(train_x))
-        x_end = torch.max(train_x) + 0.1 * (torch.max(train_x) - torch.min(train_x))
+        x_start = torch.min(train_x)
+        x_end = torch.max(train_x)
 
         timestamps[i, :] = np.linspace(x_start, x_end, num_timesteps)
         means[i, :, j] = mean
+        confidence_region[i, :, j, 0] = lower
+        confidence_region[i, :, j, 1] = upper
 
-    return timestamps, means
+    return timestamps, means, confidence_region
 
 
 def get_inferred_gaussian_process(dataset):
