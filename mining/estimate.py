@@ -722,7 +722,7 @@ def get_gp_means(dataset, model_list, likelihood_list, model_map, X_norm, X, y):
     num_opinions = len(dataset.stance_columns)
     num_timesteps = 100
     # TODO fix for actual timestamps
-    timestamps = np.full((num_users, num_timesteps), np.nan)
+    timestamps = np.full((num_users, num_timesteps, num_opinions), np.nan)
     means = np.full((num_users, num_timesteps, num_opinions), np.nan)
     confidence_region = np.full((num_users, num_timesteps, num_opinions, 2), np.nan)
     for model_idx, (i, j) in enumerate(model_map):
@@ -742,6 +742,8 @@ def get_gp_means(dataset, model_list, likelihood_list, model_map, X_norm, X, y):
         x_norm_end = min(torch.max(train_x_norm), 1.)
         # n_test = int((x_end - x_start) * num_timesteps)
         test_x = torch.linspace(x_norm_start, x_norm_end, num_timesteps)  # test inputs
+        if torch.cuda.is_available():
+            test_x = test_x.cuda()
 
         # Test points are regularly spaced along [0,1]
         # Make predictions by feeding model through likelihood
@@ -759,7 +761,7 @@ def get_gp_means(dataset, model_list, likelihood_list, model_map, X_norm, X, y):
         x_start = torch.min(train_x)
         x_end = torch.max(train_x)
 
-        timestamps[i, :] = np.linspace(x_start, x_end, num_timesteps)
+        timestamps[i, :, j] = np.linspace(x_start, x_end, num_timesteps)
         means[i, :, j] = mean
         confidence_region[i, :, j, 0] = lower
         confidence_region[i, :, j, 1] = upper
@@ -832,7 +834,7 @@ def get_spline_means(dataset, model_list, coef_bootstraps, spline_transformers, 
     num_opinions = len(dataset.stance_columns)
     num_timesteps = 100
     
-    timestamps = np.full((num_users, num_timesteps), np.nan)
+    timestamps = np.full((num_users, num_timesteps, num_opinions), np.nan)
     means = np.full((num_users, num_timesteps, num_opinions), np.nan)
     confidence_intervals = np.full((num_users, num_timesteps, num_opinions, 2), np.nan)  # New array for CIs
 
@@ -863,7 +865,7 @@ def get_spline_means(dataset, model_list, coef_bootstraps, spline_transformers, 
         x_start = torch.min(train_x)
         x_end = torch.max(train_x)
         
-        timestamps[i, :] = np.linspace(x_start, x_end, num_timesteps)
+        timestamps[i, :, j] = np.linspace(x_start, x_end, num_timesteps)
         means[i, :, j] = mean
         confidence_intervals[i, :, j, 0] = y_pred_lower
         confidence_intervals[i, :, j, 1] = y_pred_upper

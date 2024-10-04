@@ -179,7 +179,8 @@ class OpinionTimelineDataset:
             aggregation=None, 
             halflife=50.0, 
             min_num_per_stance=None,
-            subsample_users=None
+            subsample_users=None,
+            seed=0
         ):
         assert len(comment_df) > 0, "comment_df must not be empty"
         assert 'createtime' in comment_df.columns, "createtime column not found"
@@ -218,7 +219,7 @@ class OpinionTimelineDataset:
 
         self.users = self.comment_df['user_id'].to_frame().drop_duplicates().reset_index(drop=True)
         self.subsample_users = subsample_users
-        self.users = self.users.sample(n=self.subsample_users) if self.subsample_users is not None else self.users
+        self.users = self.users.sample(n=self.subsample_users, random_state=seed) if self.subsample_users is not None else self.users
 
         if user_mode_attrs is not None:
             self.users = self.users.merge(self.comment_df.groupby('user_id')[user_mode_attrs].agg(lambda x: pd.Series.mode(x)[0]).reset_index(), on='user_id')
