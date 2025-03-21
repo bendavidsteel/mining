@@ -702,7 +702,7 @@ def prep_gp_data(dataset):
     x_std = nanstd(X, dim=1)
     X_norm = (X - x_mean.unsqueeze(-1)) / x_std.unsqueeze(-1)
     y = torch.tensor(opinion_sequences).float()
-    return X_norm, X, y, classifier_indices
+    return X_norm, X, y, users, classifier_indices
 
 def get_mean_and_confidence_region(model, test_x):
     with gpytorch.settings.cholesky_max_tries(5):
