@@ -620,6 +620,8 @@ class SimpleGenerativeOpinionTimelineDataset(OpinionTimelineDataset):
                         'predicted_neutral': 20,
                     },
                 }
+            else:
+                raise ValueError("Invalid pred_profile_type")
 
             profile['favor'] = {}
             profile['favor']['precision'] = profile['true_favor']['predicted_favor'] / (profile['true_favor']['predicted_favor'] + profile['true_against']['predicted_favor'] + profile['true_neutral']['predicted_favor'])
