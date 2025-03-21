@@ -3,6 +3,7 @@ from typing import Any, Dict
 
 import gpytorch
 import gpytorch.constraints
+from gpytorch.likelihoods import OrdinalLikelihood
 import numpy as np
 import pyro
 import pyro.distributions as dist
@@ -474,7 +475,7 @@ def get_dirichlet_gp_model(train_x, train_y, lengthscale_loc=1.0, lengthscale_sc
 class GPClassificationModel(gpytorch.models.ApproximateGP):
     def __init__(self, train_x, lengthscale_loc=1.0, lengthscale_scale=0.5):
         variational_distribution = gpytorch.variational.CholeskyVariationalDistribution(train_x.size(0))
-        variational_strategy = gpytorch.variational.UnwhitenedVariationalStrategy(
+        variational_strategy = gpytorch.variational.VariationalStrategy(
             self, train_x, variational_distribution, learn_inducing_locations=False
         )
         super(GPClassificationModel, self).__init__(variational_strategy)
@@ -490,20 +491,33 @@ class GPClassificationModel(gpytorch.models.ApproximateGP):
         latent_pred = gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
         return latent_pred
     
-    def predict(self, x):
-        latent_pred = self(x)
-        # Apply tanh to constrain the mean
-        constrained_mean = torch.tanh(latent_pred.mean)
+    # def predict(self, x):
+    #     latent_pred = self(x)
+    #     # Apply tanh to constrain the mean
+    #     constrained_mean = torch.tanh(latent_pred.mean)
         
-        # Adjust the covariance matrix using the derivative of tanh
-        derivative_tanh = 1 - constrained_mean**2
-        constrained_covar = derivative_tanh.unsqueeze(-1) * latent_pred.covariance_matrix * derivative_tanh.unsqueeze(-2)
+    #     # Adjust the covariance matrix using the derivative of tanh
+    #     derivative_tanh = 1 - constrained_mean**2
+    #     constrained_covar = derivative_tanh.unsqueeze(-1) * latent_pred.covariance_matrix * derivative_tanh.unsqueeze(-2)
         
-        constrained_pred = gpytorch.distributions.MultivariateNormal(constrained_mean, constrained_covar)
+    #     constrained_pred = gpytorch.distributions.MultivariateNormal(constrained_mean, constrained_covar)
         
-        return constrained_pred
+    #     return constrained_pred
 
-class OrdinalLikelihood(gpytorch.likelihoods.Likelihood):
+def inv_probit(x, jitter=1e-3):
+    """
+    Inverse probit function (standard normal CDF) with jitter for numerical stability.
+    
+    Args:
+        x: Input tensor
+        jitter: Small constant to ensure outputs are strictly between 0 and 1
+        
+    Returns:
+        Probabilities between jitter and 1-jitter
+    """
+    return 0.5 * (1.0 + torch.erf(x / torch.sqrt(torch.tensor(2.0)))) * (1 - 2 * jitter) + jitter
+
+class OrdinalWithErrorLikelihood(gpytorch.likelihoods._OneDimensionalLikelihood):
     def __init__(self, num_classes, all_classifier_profiles):
         super().__init__()
         self.num_classes = num_classes
@@ -512,14 +526,13 @@ class OrdinalLikelihood(gpytorch.likelihoods.Likelihood):
             for stance in self.predictor_confusion_probs:
                 self.predictor_confusion_probs[stance]['predict_probs'] = self.predictor_confusion_probs[stance]['predict_probs'].to('cuda')
                 self.predictor_confusion_probs[stance]['true_probs'] = self.predictor_confusion_probs[stance]['true_probs'].to('cuda')
-        thres = 0.5
-        limit = 1
-        self.register_parameter('cutpoints', torch.nn.Parameter(torch.linspace(-thres, thres, self.num_classes-1)))
-        self.register_prior('cutpoints_prior', gpytorch.priors.NormalPrior(torch.linspace(-thres, thres, self.num_classes-1), 0.2), 'cutpoints')
-        self.register_constraint('cutpoints', gpytorch.constraints.Interval(
-            torch.linspace(-limit, limit, self.num_classes)[:-1], 
-            torch.linspace(-limit, limit, self.num_classes)[1:]
-        ))
+        
+        self.cutpoints = torch.tensor([-0.5, 0.5])
+        if torch.cuda.is_available():
+            self.cutpoints = self.cutpoints.to('cuda')
+
+        self.register_parameter('sigma', torch.nn.Parameter(torch.tensor(1.0)))
+        self.register_constraint('sigma', gpytorch.constraints.Positive())
 
         self.classifier_ids = None
         self.stance = None
@@ -537,28 +550,32 @@ class OrdinalLikelihood(gpytorch.likelihoods.Likelihood):
         if isinstance(function_samples, gpytorch.distributions.MultivariateNormal):
             function_samples = function_samples.sample()
         
-        function_samples = torch.tanh(function_samples).unsqueeze(-1)
-        cutpoints = self.cutpoints.unsqueeze(0).unsqueeze(0)
+        # Compute scaled bin edges
+        scaled_edges = self.cutpoints / self.sigma
+        scaled_edges_left = torch.cat([scaled_edges, torch.tensor([torch.inf], device=scaled_edges.device)], dim=-1)
+        scaled_edges_right = torch.cat([torch.tensor([-torch.inf], device=scaled_edges.device), scaled_edges])
         
-        cumulative_probs = torch.sigmoid(cutpoints - function_samples)
-        probs = torch.cat([
-            cumulative_probs[..., :1],
-            cumulative_probs[..., 1:] - cumulative_probs[..., :-1],
-            1 - cumulative_probs[..., -1:],
-        ], dim=-1)
+        # Calculate cumulative probabilities using standard normal CDF (probit function)
+        # These represent P(Y ≤ k | F)
+        function_samples = function_samples.unsqueeze(-1)
+        scaled_edges_left = scaled_edges_left.reshape(1, 1, -1)
+        scaled_edges_right = scaled_edges_right.reshape(1, 1, -1)
+        probs = inv_probit(scaled_edges_left - function_samples / self.sigma) - inv_probit(scaled_edges_right - function_samples / self.sigma)
         
         # Apply confusion matrix
         predict_probs = torch.einsum('sxc,xco->sxo', probs, self.predictor_confusion_probs[self.stance]['predict_probs'][self.classifier_ids])
         
         return torch.distributions.Categorical(probs=predict_probs)
 
-    def log_marginal(self, observations, function_dist, *args, **kwargs):
-        function_samples = function_dist.rsample()
-        return self.forward(function_samples).log_prob(observations).sum()
+    # def log_marginal(self, observations, function_dist, *args, **kwargs):
+    #     function_samples = function_dist.rsample()
+    #     return self.forward(function_samples).log_prob(observations).sum()
 
 
 def get_ordinal_gp_model(train_x, train_y, all_classifier_profiles, lengthscale_loc=1.0, lengthscale_scale=0.5):
-    likelihood = OrdinalLikelihood(3, all_classifier_profiles)
+    bin_edges = torch.tensor([-0.5, 0.5])
+    likelihood = OrdinalLikelihood(bin_edges)
+    # likelihood = OrdinalWithErrorLikelihood(3, all_classifier_profiles)
     model = GPClassificationModel(train_x, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale)
     return model, likelihood
 
@@ -610,7 +627,7 @@ def get_gp_models(X_norm, y, classifier_ids, stance_targets, all_classifier_prof
 def train_gaussian_process(X_norm, y, classifier_ids, stance_targets, all_classifier_profiles, lengthscale_loc=1.0, lengthscale_scale=0.5, gp_type='dirichlet'):
     model_list, likelihood_list, model_map, train_xs, train_ys = get_gp_models(X_norm, y, classifier_ids, stance_targets, all_classifier_profiles, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale, gp_type=gp_type)
 
-    training_iter = 50
+    training_iter = 500
     losses = []
     if gp_type == 'normal':
         model_list.train()
@@ -657,21 +674,29 @@ def train_gaussian_process(X_norm, y, classifier_ids, stance_targets, all_classi
             optimizer = torch.optim.Adam([
                 {'params': model.parameters()},  # Includes GaussianLikelihood parameters
                 {'params': likelihood.parameters()},
-            ], lr=0.1)
+            ], lr=0.05)
+            training_iter = 5000
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, int(training_iter / 10))
             mll = gpytorch.mlls.VariationalELBO(likelihood, model, train_y.numel())
-            training_iter = 1000
+            
             with gpytorch.settings.cholesky_max_tries(5):
                 best_loss = torch.tensor(float('inf'))
                 num_since_best = 0
-                num_iters_before_stopping = training_iter // 10
+                num_iters_before_stopping = training_iter // 5
                 for k in range(training_iter):
                     optimizer.zero_grad()
-                    output = model(train_X)
-                    loss = -mll(output, train_y)
+                    with gpytorch.settings.variational_cholesky_jitter(1e-4):
+                        output = model(train_X)
+                        loss = -mll(output, train_y)
                     loss.backward()
+                    # Gradient clipping to prevent exploding gradients
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(likelihood.parameters(), max_norm=1.0)
+            
                     if k % 50 == 0:
                         print('Iter %d/%d - Loss: %.3f' % (k + 1, training_iter, loss.item()))
                     optimizer.step()
+                    scheduler.step(k)
                     losses.append(loss.item())
                     if loss.item() < best_loss:
                         best_loss = loss.item()
@@ -793,6 +818,19 @@ def fit_spline_with_ci(X, y, n_knots=4, degree=3, alpha=1e-3, n_bootstraps=1000)
     
     return model, coef_bootstrap, spline_transformer
 
+def spline_means(X, y, n_bootstraps=1000, alpha=1e-2):
+    X = torch.tensor(X).float()
+    # max_x = torch.max(torch.nan_to_num(X, 0))
+    # min_x = torch.min(torch.nan_to_num(X, torch.inf))
+    # X_norm = (X - min_x) / (max_x - min_x)
+    x_mean = torch.nanmean(X, dim=1)
+    x_std = nanstd(X, dim=1)
+    X_norm = (X - x_mean.unsqueeze(-1)) / x_std.unsqueeze(-1)
+    y = torch.tensor(y).float()
+    models, coef_bootstraps, spline_transformers, model_map = get_splines(X, y, n_bootstraps=n_bootstraps, alpha=alpha)
+    timestamps, means, confidence_intervals = get_spline_means(models, coef_bootstraps, spline_transformers, model_map, X_norm, X, y)
+    return timestamps, means, confidence_intervals
+
 def get_splines(X_norm, y, n_knots=4, degree=3, alpha=1e-3, n_bootstraps=1000):
     num_users = X_norm.shape[0]
     num_opinions = y.shape[2]
@@ -827,9 +865,9 @@ def get_splines(X_norm, y, n_knots=4, degree=3, alpha=1e-3, n_bootstraps=1000):
     
     return models, coef_bootstraps, spline_transformers, model_map
 
-def get_spline_means(dataset, model_list, coef_bootstraps, spline_transformers, model_map, X_norm, X, y, ci=95):
+def get_spline_means(model_list, coef_bootstraps, spline_transformers, model_map, X_norm, X, y, ci=95):
     num_users = X_norm.shape[0]
-    num_opinions = len(dataset.stance_columns)
+    num_opinions = y.shape[2]
     num_timesteps = 100
     
     timestamps = np.full((num_users, num_timesteps), np.nan)
