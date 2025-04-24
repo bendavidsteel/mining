@@ -3,7 +3,6 @@ from typing import Any, Dict
 
 import gpytorch
 import gpytorch.constraints
-from gpytorch.likelihoods import OrdinalLikelihood
 import numpy as np
 import pyro
 import pyro.distributions as dist
@@ -574,8 +573,8 @@ class OrdinalWithErrorLikelihood(gpytorch.likelihoods._OneDimensionalLikelihood)
 
 def get_ordinal_gp_model(train_x, train_y, all_classifier_profiles, lengthscale_loc=1.0, lengthscale_scale=0.5):
     bin_edges = torch.tensor([-0.5, 0.5])
-    likelihood = OrdinalLikelihood(bin_edges)
-    # likelihood = OrdinalWithErrorLikelihood(3, all_classifier_profiles)
+    # likelihood = OrdinalLikelihood(bin_edges)
+    likelihood = OrdinalWithErrorLikelihood(3, all_classifier_profiles)
     model = GPClassificationModel(train_x, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale)
     return model, likelihood
 
