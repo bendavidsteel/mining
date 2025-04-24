@@ -1,9 +1,11 @@
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import gpytorch
 import gpytorch.constraints
 from gpytorch.likelihoods import OrdinalLikelihood
+from gpytorch.priors import Prior
+from gpytorch.constraints import Interval, Positive
 import numpy as np
 import pyro
 import pyro.distributions as dist
@@ -481,6 +483,7 @@ class GPClassificationModel(gpytorch.models.ApproximateGP):
         super(GPClassificationModel, self).__init__(variational_strategy)
         self.mean_module = gpytorch.means.ConstantMean(constant_constraint=gpytorch.constraints.Interval(-1, 1))
         lengthscale_prior = gpytorch.priors.LogNormalPrior(loc=torch.log(torch.tensor(lengthscale_loc)), scale=lengthscale_scale)
+        # TODO consider switching to rational quadratic kernel https://www.cs.toronto.edu/~duvenaud/cookbook/
         self.covar_module = gpytorch.kernels.ScaleKernel(
             gpytorch.kernels.RBFKernel(lengthscale_prior=lengthscale_prior)
         )
@@ -518,24 +521,48 @@ def inv_probit(x, jitter=1e-3):
     return 0.5 * (1.0 + torch.erf(x / torch.sqrt(torch.tensor(2.0)))) * (1 - 2 * jitter) + jitter
 
 class OrdinalWithErrorLikelihood(gpytorch.likelihoods._OneDimensionalLikelihood):
-    def __init__(self, num_classes, all_classifier_profiles):
+    def __init__(
+            self, 
+            bin_edges: Tensor, 
+            all_classifier_profiles,
+            batch_shape: torch.Size = torch.Size([]),
+            sigma_prior: Optional[Prior] = None,
+            sigma_constraint: Optional[Interval] = None,
+        ):
         super().__init__()
-        self.num_classes = num_classes
         self.predictor_confusion_probs = get_predictor_confusion_probs(all_classifier_profiles)
         if torch.cuda.is_available():
             for stance in self.predictor_confusion_probs:
                 self.predictor_confusion_probs[stance]['predict_probs'] = self.predictor_confusion_probs[stance]['predict_probs'].to('cuda')
                 self.predictor_confusion_probs[stance]['true_probs'] = self.predictor_confusion_probs[stance]['true_probs'].to('cuda')
         
-        self.cutpoints = torch.tensor([-0.5, 0.5])
-        if torch.cuda.is_available():
-            self.cutpoints = self.cutpoints.to('cuda')
+        self.num_bins = len(bin_edges) + 1
+        self.register_parameter("bin_edges", torch.nn.Parameter(bin_edges, requires_grad=False))
 
-        self.register_parameter('sigma', torch.nn.Parameter(torch.tensor(1.0)))
-        self.register_constraint('sigma', gpytorch.constraints.Positive())
+        if sigma_constraint is None:
+            sigma_constraint = Positive()
+
+        self.raw_sigma = torch.nn.Parameter(torch.ones(*batch_shape, 1))
+        if sigma_prior is not None:
+            self.register_prior("sigma_prior", sigma_prior, lambda m: m.sigma, lambda m, v: m._set_sigma(v))
+
+        self.register_constraint("raw_sigma", sigma_constraint)
 
         self.classifier_ids = None
         self.stance = None
+
+    @property
+    def sigma(self) -> Tensor:
+        return self.raw_sigma_constraint.transform(self.raw_sigma)
+
+    @sigma.setter
+    def sigma(self, value: Tensor) -> None:
+        self._set_sigma(value)
+
+    def _set_sigma(self, value: Tensor) -> None:
+        if not torch.is_tensor(value):
+            value = torch.as_tensor(value).to(self.raw_sigma)
+        self.initialize(raw_sigma=self.raw_sigma_constraint.inverse_transform(value))
 
     def set_classifier_ids(self, classifier_ids):
         self.classifier_ids = classifier_ids
@@ -547,11 +574,8 @@ class OrdinalWithErrorLikelihood(gpytorch.likelihoods._OneDimensionalLikelihood)
         assert self.classifier_ids is not None, "Classifier IDs not set"
         assert self.stance is not None, "Stance not set"
 
-        if isinstance(function_samples, gpytorch.distributions.MultivariateNormal):
-            function_samples = function_samples.sample()
-        
         # Compute scaled bin edges
-        scaled_edges = self.cutpoints / self.sigma
+        scaled_edges = self.bin_edges / self.sigma
         scaled_edges_left = torch.cat([scaled_edges, torch.tensor([torch.inf], device=scaled_edges.device)], dim=-1)
         scaled_edges_right = torch.cat([torch.tensor([-torch.inf], device=scaled_edges.device), scaled_edges])
         
@@ -564,7 +588,7 @@ class OrdinalWithErrorLikelihood(gpytorch.likelihoods._OneDimensionalLikelihood)
         
         # Apply confusion matrix
         predict_probs = torch.einsum('sxc,xco->sxo', probs, self.predictor_confusion_probs[self.stance]['predict_probs'][self.classifier_ids])
-        
+
         return torch.distributions.Categorical(probs=predict_probs)
 
     # def log_marginal(self, observations, function_dist, *args, **kwargs):
@@ -574,8 +598,8 @@ class OrdinalWithErrorLikelihood(gpytorch.likelihoods._OneDimensionalLikelihood)
 
 def get_ordinal_gp_model(train_x, train_y, all_classifier_profiles, lengthscale_loc=1.0, lengthscale_scale=0.5):
     bin_edges = torch.tensor([-0.5, 0.5])
-    likelihood = OrdinalLikelihood(bin_edges)
-    # likelihood = OrdinalWithErrorLikelihood(3, all_classifier_profiles)
+    # likelihood = OrdinalLikelihood(bin_edges)
+    likelihood = OrdinalWithErrorLikelihood(bin_edges, all_classifier_profiles)
     model = GPClassificationModel(train_x, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale)
     return model, likelihood
 

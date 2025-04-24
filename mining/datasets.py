@@ -584,6 +584,24 @@ class SimpleGenerativeOpinionTimelineDataset(OpinionTimelineDataset):
                         'predicted_neutral': 1,
                     },
                 }
+            elif pred_profile_type == 'med_precision':
+                profile = {
+                    'true_favor': {
+                        'predicted_favor': 11,
+                        'predicted_against': 1,
+                        'predicted_neutral': 3,
+                    },
+                    'true_against': {
+                        'predicted_favor': 1,
+                        'predicted_against': 11,
+                        'predicted_neutral': 4,
+                    },
+                    'true_neutral': {
+                        'predicted_favor': 4,
+                        'predicted_against': 3,
+                        'predicted_neutral': 20,
+                    },
+                }
             elif pred_profile_type == 'low_precision':
                 profile = {
                     'true_favor': {
