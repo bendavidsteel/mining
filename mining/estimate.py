@@ -578,7 +578,7 @@ def get_ordinal_gp_model(train_x, train_y, all_classifier_profiles, lengthscale_
     model = GPClassificationModel(train_x, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale)
     return model, likelihood
 
-def get_gp_models(X_norm, y, classifier_ids, stance_targets, all_classifier_profiles, lengthscale_loc=1.0, lengthscale_scale=0.5, gp_type='dirichlet'):
+def get_users_gp_models(X_norm, y, classifier_ids, stance_targets, all_classifier_profiles, lengthscale_loc=1.0, lengthscale_scale=0.5, gp_type='dirichlet'):
     num_users = X_norm.shape[0]
     num_opinions = y.shape[2]
     models = []
@@ -623,8 +623,16 @@ def get_gp_models(X_norm, y, classifier_ids, stance_targets, all_classifier_prof
         likelihood_list = likelihoods
     return model_list, likelihood_list, model_map, train_xs, train_ys
 
-def train_gaussian_process(X_norm, y, classifier_ids, stance_targets, all_classifier_profiles, lengthscale_loc=1.0, lengthscale_scale=0.5, gp_type='dirichlet'):
-    model_list, likelihood_list, model_map, train_xs, train_ys = get_gp_models(X_norm, y, classifier_ids, stance_targets, all_classifier_profiles, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale, gp_type=gp_type)
+def setup_ordinal_gp_model(timestamps, stance, all_classifier_profiles):
+    lengthscale_loc = 1
+    lengthscale_scale = 0.5
+    model, likelihood = get_ordinal_gp_model(train_x, train_y, all_classifier_profiles, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale)
+    likelihood.set_classifier_ids(train_classifier_ids)
+    likelihood.set_stance(stance_targets[j])
+    return model, likelihood, train_x, train_y
+
+def train_users_gaussian_process(X_norm, y, classifier_ids, stance_targets, all_classifier_profiles, lengthscale_loc=1.0, lengthscale_scale=0.5, gp_type='dirichlet'):
+    model_list, likelihood_list, model_map, train_xs, train_ys = get_users_gp_models(X_norm, y, classifier_ids, stance_targets, all_classifier_profiles, lengthscale_loc=lengthscale_loc, lengthscale_scale=lengthscale_scale, gp_type=gp_type)
 
     training_iter = 500
     losses = []
@@ -663,49 +671,73 @@ def train_gaussian_process(X_norm, y, classifier_ids, stance_targets, all_classi
                 losses.append(loss.item())
     elif gp_type == 'ordinal':
         for model, likelihood, model_idxs, train_X, train_y in zip(model_list, likelihood_list, model_map, train_xs, train_ys):
-            if torch.cuda.is_available():
-                model = model.cuda()
-                likelihood = likelihood.cuda()
-                train_X = train_X.cuda()
-                train_y = train_y.cuda()
-            model.train()
-            likelihood.train()
-            optimizer = torch.optim.Adam([
-                {'params': model.parameters()},  # Includes GaussianLikelihood parameters
-                {'params': likelihood.parameters()},
-            ], lr=0.05)
-            training_iter = 5000
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, int(training_iter / 10))
-            mll = gpytorch.mlls.VariationalELBO(likelihood, model, train_y.numel())
-            
-            with gpytorch.settings.cholesky_max_tries(5):
-                best_loss = torch.tensor(float('inf'))
-                num_since_best = 0
-                num_iters_before_stopping = training_iter // 5
-                for k in range(training_iter):
-                    optimizer.zero_grad()
-                    with gpytorch.settings.variational_cholesky_jitter(1e-4):
-                        output = model(train_X)
-                        loss = -mll(output, train_y)
-                    loss.backward()
-                    # Gradient clipping to prevent exploding gradients
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    torch.nn.utils.clip_grad_norm_(likelihood.parameters(), max_norm=1.0)
-            
-                    if k % 50 == 0:
-                        print('Iter %d/%d - Loss: %.3f' % (k + 1, training_iter, loss.item()))
-                    optimizer.step()
-                    scheduler.step(k)
-                    losses.append(loss.item())
-                    if loss.item() < best_loss:
-                        best_loss = loss.item()
-                        num_since_best = 0
-                    else:
-                        num_since_best += 1
-                    if num_since_best > num_iters_before_stopping:
-                        break
+            train_ordinal_likelihood_gp(model, likelihood, train_X, train_y)
 
     return model_list, likelihood_list, model_map, losses
+
+def train_ordinal_likelihood_gp(model, likelihood, train_X, train_y):
+    if torch.cuda.is_available():
+        model = model.cuda()
+        likelihood = likelihood.cuda()
+        train_X = train_X.cuda()
+        train_y = train_y.cuda()
+    model.train()
+    likelihood.train()
+    optimizer = torch.optim.Adam([
+        {'params': model.parameters()},  # Includes GaussianLikelihood parameters
+        {'params': likelihood.parameters()},
+    ], lr=0.05)
+    training_iter = 5000
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, int(training_iter / 10))
+    mll = gpytorch.mlls.VariationalELBO(likelihood, model, train_y.numel())
+    
+    with gpytorch.settings.cholesky_max_tries(5):
+        best_loss = torch.tensor(float('inf'))
+        num_since_best = 0
+        num_iters_before_stopping = training_iter // 5
+        for k in range(training_iter):
+            optimizer.zero_grad()
+            with gpytorch.settings.variational_cholesky_jitter(1e-4):
+                output = model(train_X)
+                loss = -mll(output, train_y)
+            loss.backward()
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(likelihood.parameters(), max_norm=1.0)
+    
+            if k % 50 == 0:
+                print('Iter %d/%d - Loss: %.3f' % (k + 1, training_iter, loss.item()))
+            optimizer.step()
+            scheduler.step(k)
+            losses.append(loss.item())
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+                num_since_best = 0
+            else:
+                num_since_best += 1
+            if num_since_best > num_iters_before_stopping:
+                        break
+
+    return model, likelihood
+
+def get_model_prediction(model, test_x):
+    model.eval()
+
+    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        min_x = torch.min(train_x)
+        max_x = torch.max(train_x)
+        start_x = min_x - 0.1 * (max_x - min_x)
+        end_x = max_x + 0.1 * (max_x - min_x)
+        test_x = torch.linspace(start_x, end_x, n_test).to('cuda')
+        test_classifier_ids = torch.zeros(n_test, dtype=torch.long)
+        model = model.cuda()
+        model_pred = model.predict(test_x)
+        # likelihood.set_classifier_ids(test_classifier_ids)
+        
+        # Get upper and lower confidence bounds
+        lower, upper = model_pred.confidence_region()
+
+    return model_pred.loc.cpu().numpy(), lower.cpu().numpy(), upper.cpu().numpy()
 
 def nanstd(o,dim):
     return torch.sqrt(

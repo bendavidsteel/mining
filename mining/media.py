@@ -21,9 +21,17 @@ class Transcription:
         self.model = whisperx.load_model("large-v2", device, compute_type=compute_type)
         self.diarize_model = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=hf_token).to(torch.device(device))
 
-        self.align_models = {}
+    def process_video_file(self, video_path, batch_size=16):
+        with tempfile.NamedTemporaryFile(suffix='.mp3') as temp_audio_file:
+            temp_audio_path = temp_audio_file.name
+            # Use moviepy to extract audio
+            with VideoFileClip(video_path) as video:
+                video.audio.write_audiofile(temp_audio_path)
+            
+            audio = whisperx.load_audio(temp_audio_path)
+        return self.process_audio(audio, batch_size=batch_size)
 
-    def process_video(self, video_bytes, batch_size=16):
+    def process_video_bytes(self, video_bytes, batch_size=16):
         # Create a temporary file to write the mp4 bytes
         with tempfile.NamedTemporaryFile(suffix='.mp4') as temp_video_file:
             with tempfile.NamedTemporaryFile(suffix='.mp3') as temp_audio_file:
@@ -56,11 +64,7 @@ class Transcription:
 
         # 2. Align whisper output
         language = result['language']
-        if language not in self.align_models:
-            model_a, metadata = whisperx.load_align_model(language_code=language, device=device)
-            self.align_models[language] = (model_a, metadata)
-        else:
-            model_a, metadata = self.align_models[language]
+        model_a, metadata = whisperx.load_align_model(language_code=language, device=device)
         result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
 
         # delete model if low on GPU resources
